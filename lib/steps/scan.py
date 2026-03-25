@@ -37,6 +37,7 @@ def run_scan(state, project_root, modules):
                 m, state, changed_by_module, boundary_context, p0_context,
             )
 
+            timeout = m.estimate_timeout(project_root, task="scan")
             future = pool.submit(
                 call_claude_bare,
                 prompt=prompt,
@@ -45,6 +46,7 @@ def run_scan(state, project_root, modules):
                 output_schema=FINDINGS_SCHEMA,
                 max_turns=30,
                 cwd=project_root,
+                timeout=timeout,
             )
             futures[future] = m
 
@@ -208,6 +210,7 @@ def run_deep_r2(state, project_root, modules, r1_findings):
                 changed_files_section=changed_files_section,
                 boundary_section=boundary_section,
             )
+            timeout = m.estimate_timeout(project_root, task="scan")
             future = pool.submit(
                 call_claude_bare,
                 prompt=prompt,
@@ -216,6 +219,7 @@ def run_deep_r2(state, project_root, modules, r1_findings):
                 output_schema=FINDINGS_SCHEMA,
                 max_turns=30,
                 cwd=project_root,
+                timeout=timeout,
             )
             futures[future] = m
 

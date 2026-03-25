@@ -5,10 +5,25 @@ config.yaml 读写
 零外部依赖，不使用 PyYAML。
 """
 
+import logging
 import os
 import re
 from dataclasses import dataclass, field
 from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+# 语言复杂度系数：Swift/ObjC 的 UI+并发特性需要更多分析时间
+_LANG_COMPLEXITY = {
+    "swift": 1.8,
+    "go": 1.0,
+    "typescript": 1.2,
+    "python": 1.0,
+}
+
+# 超时下限和上限（秒）
+_TIMEOUT_MIN = 180
+_TIMEOUT_MAX = 900
 
 
 @dataclass
@@ -24,6 +39,85 @@ class ModuleConfig:
     unit_command: str = ""
     cross_command: str = ""
     errcheck_command: str = ""
+
+    def estimate_timeout(self, project_root: str, task: str = "scan") -> int:
+        """根据模块规模和语言复杂度动态估算 Claude 调用超时。
+
+        估算公式：
+            timeout = base + (file_count × per_file) + (total_kb × per_kb)
+            timeout *= lang_complexity
+            clamp(TIMEOUT_MIN, TIMEOUT_MAX)
+
+        参数:
+            project_root: 项目根目录
+            task: 任务类型 — "scan"（扫描）或 "verify"（写测试/修复）
+
+        返回:
+            超时秒数
+        """
+        src_path = os.path.join(project_root, self.src_dir) if self.src_dir else ""
+        file_count, total_bytes = _measure_source(src_path)
+
+        total_kb = total_bytes / 1024.0
+        lang_factor = _LANG_COMPLEXITY.get(self.language, 1.0)
+
+        if task == "verify":
+            # 验证只操作单个文件附近，基数低但保留语言系数
+            base, per_file, per_kb = 120, 0.5, 0.02
+        else:
+            # 扫描需要广读代码；字节影响远小于文件数（Claude 按 token 读）
+            base, per_file, per_kb = 150, 1.2, 0.03
+
+        raw = (base + file_count * per_file + total_kb * per_kb) * lang_factor
+        timeout = int(max(_TIMEOUT_MIN, min(_TIMEOUT_MAX, raw)))
+
+        logger.info(
+            "estimate_timeout: %s task=%s files=%d kb=%.0f lang=%s factor=%.1f → %ds",
+            self.name, task, file_count, total_kb, self.language, lang_factor, timeout,
+        )
+        return timeout
+
+
+def _measure_source(src_path: str) -> tuple:
+    """统计目录下源码文件数和总字节数。
+
+    只统计常见源码扩展名，跳过 node_modules / .build / vendor 等。
+    返回 (file_count, total_bytes)。
+    """
+    if not src_path or not os.path.isdir(src_path):
+        return 0, 0
+
+    source_exts = {
+        ".ts", ".tsx", ".js", ".jsx",
+        ".swift", ".m", ".h",
+        ".go",
+        ".py",
+    }
+    skip_dirs = {
+        "node_modules", ".build", "vendor", "dist", "build", "__pycache__",
+        # Go 标准库 / 工具链源码（常见于 GOROOT 拷贝或 vendor 式项目）
+        "go", "testdata",
+        # Xcode / Swift Package Manager
+        ".swiftpm", "Pods", "DerivedData", "SourcePackages",
+        # 通用
+        ".git", ".evo-review", "bin", "deploy", "scripts",
+    }
+
+    file_count = 0
+    total_bytes = 0
+
+    for root, dirs, files in os.walk(src_path):
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
+        for f in files:
+            ext = os.path.splitext(f)[1]
+            if ext in source_exts:
+                file_count += 1
+                try:
+                    total_bytes += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+
+    return file_count, total_bytes
 
 
 def _parse_simple_yaml(text: str) -> dict:

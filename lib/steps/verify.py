@@ -159,6 +159,7 @@ def _verify_single_bug(bug, wt, module, project_root):
     from lib.schemas.verify import CHECK_REASON_SCHEMA
 
     bug_id = bug["id"]
+    verify_timeout = module.estimate_timeout(project_root, task="verify")
     logger.info(f"[{bug_id}] 开始验证: {bug.get('file')}:{bug.get('line')} — {bug.get('description', '')[:60]}")
 
     # 1. 写测试
@@ -178,6 +179,7 @@ def _verify_single_bug(bug, wt, module, project_root):
             tools="Read,Glob,Grep,Edit,Write",
             max_turns=15,
             cwd=wt.path,
+            timeout=verify_timeout,
         )
     except Exception as e:
         logger.error(f"[{bug_id}] 写测试失败: {e}")
@@ -236,6 +238,7 @@ def _verify_single_bug(bug, wt, module, project_root):
             tools="Read,Glob,Grep,Edit,Write",
             max_turns=15,
             cwd=wt.path,
+            timeout=verify_timeout,
         )
     except Exception as e:
         logger.error(f"[{bug_id}] 写修复失败: {e}")
@@ -265,6 +268,7 @@ def _verify_single_bug(bug, wt, module, project_root):
             tools="Read,Glob,Grep,Edit,Write",
             max_turns=15,
             cwd=wt.path,
+            timeout=verify_timeout,
         )
     except Exception as e:
         _revert_changes(wt.path, bug)
