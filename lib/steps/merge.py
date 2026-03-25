@@ -25,15 +25,20 @@ def run_merge(state, project_root):
 
     print(f"\n以上 {verified_count} 个已验证修复在 worktree 分支中。")
 
-    try:
-        user_input = input("确认合并？[y/n/选择编号]: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print("\n已取消")
-        return False
+    # 非交互模式（后台运行）自动确认合并
+    import sys
+    if not sys.stdin.isatty():
+        logger.info("非交互模式，自动确认合并")
+    else:
+        try:
+            user_input = input("确认合并？[y/n/选择编号]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n已取消")
+            return False
 
-    if user_input.lower() not in ('y', 'yes', ''):
-        print("已取消合并")
-        return False
+        if user_input.lower() not in ('y', 'yes', ''):
+            print("已取消合并")
+            return False
 
     # 执行合并（同一 Xcode 项目的多个模块共享 worktree，去重防止重复合并）
     merge_failed = False

@@ -19,6 +19,11 @@ def run_confirm(state, project_root):
 
     print(f"\n以上 {total_gaps} 个盲区（涉及 {total_bugs} 个 bug），确认后直接执行。")
 
+    # 非交互模式（stdin 关闭，如后台运行）自动全部确认
+    if not sys.stdin.isatty():
+        logger.info("非交互模式，自动全部确认")
+        return [f["id"] for f in state.findings]
+
     try:
         user_input = input("Enter 全部确认 / 输入 F 编号排除（如 F1,F3）/ q 退出: ").strip()
     except (EOFError, KeyboardInterrupt):
