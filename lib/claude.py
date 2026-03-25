@@ -47,6 +47,7 @@ def call_claude_bare(
         "--setting-sources", "",      # 不加载任何 settings（跳过 hooks / 项目配置）
         "--disable-slash-commands",   # 跳过 skills / plugins
         "--strict-mcp-config",        # 不自动发现 MCP（未传 --mcp-config 则无 MCP）
+        "--permission-mode", "dontAsk",  # 仅执行 --allowedTools 预批准的工具
         "-p", prompt,
         "--model", model,
         "--output-format", "json",
@@ -135,6 +136,7 @@ def call_claude_session(
     """
     cmd = [
         "claude",
+        "--permission-mode", "dontAsk",  # 仅执行 --allowedTools 预批准的工具
         "-p", prompt,
         "--model", model,
         "--output-format", "json",
