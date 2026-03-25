@@ -296,44 +296,51 @@ def _precheck_worktree(wt: Worktree, project_root: str) -> None:
     - TypeScript: 如果有 package.json 但无 node_modules，跑 npm install
     - Swift: 无需特殊处理（Xcode 自动管理）
 
-    预检失败只记 warning，不阻塞流程。
+    预检失败只记 warning，不阻塞流程。所有操作包在 try-except 中防止崩溃。
     """
-    from lib.config import ModuleConfig
-
     for mod_name in wt.modules:
-        # 检查 worktree 中的子目录
-        # Go 模块检查
-        go_mod = os.path.join(wt.path, mod_name, "go.mod")
-        if not os.path.exists(go_mod):
-            go_mod = os.path.join(wt.path, "go.mod")
-        if os.path.exists(go_mod):
-            mod_dir = os.path.dirname(go_mod)
-            result = subprocess.run(
-                ["go", "list", "./..."],
-                cwd=mod_dir,
-                capture_output=True, text=True, timeout=30,
-            )
-            if result.returncode != 0:
-                logger.warning(
-                    "worktree 预检: Go 模块 %s 的 go list 失败: %s",
-                    mod_name, result.stderr[:200],
-                )
-            else:
-                logger.info("worktree 预检: Go 模块 %s 可用", mod_name)
+        try:
+            _precheck_single_module(wt.path, mod_name)
+        except Exception as e:
+            logger.warning("worktree 预检 %s 异常（不阻塞）: %s", mod_name, e)
 
-        # TypeScript 模块检查
-        pkg_json = os.path.join(wt.path, mod_name, "package.json")
-        if os.path.exists(pkg_json):
-            node_modules = os.path.join(wt.path, mod_name, "node_modules")
-            if not os.path.isdir(node_modules):
-                logger.info("worktree 预检: %s 缺少 node_modules，执行 npm install", mod_name)
-                subprocess.run(
-                    ["npm", "install", "--prefer-offline", "--no-audit"],
-                    cwd=os.path.dirname(pkg_json),
-                    capture_output=True, text=True, timeout=120,
-                )
-            else:
-                logger.info("worktree 预检: TypeScript 模块 %s 可用", mod_name)
+
+def _precheck_single_module(wt_path: str, mod_name: str) -> None:
+    """单个模块的环境预检。"""
+    mod_dir = os.path.join(wt_path, mod_name)
+
+    # Go 模块检查 — 在模块目录或 worktree 根目录找 go.mod
+    go_mod = os.path.join(mod_dir, "go.mod")
+    if not os.path.exists(go_mod):
+        go_mod = os.path.join(wt_path, "go.mod")
+    if os.path.exists(go_mod):
+        go_dir = os.path.dirname(go_mod)
+        result = subprocess.run(
+            ["go", "list", "./..."],
+            cwd=go_dir,
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "worktree 预检: Go 模块 %s 的 go list 失败: %s",
+                mod_name, result.stderr[:200],
+            )
+        else:
+            logger.info("worktree 预检: Go 模块 %s 可用", mod_name)
+
+    # TypeScript 模块检查 — 在模块目录找 package.json
+    pkg_json = os.path.join(mod_dir, "package.json")
+    if os.path.exists(pkg_json):
+        node_modules = os.path.join(mod_dir, "node_modules")
+        if not os.path.isdir(node_modules):
+            logger.info("worktree 预检: %s 缺少 node_modules，执行 npm install", mod_name)
+            subprocess.run(
+                ["npm", "install", "--prefer-offline", "--no-audit"],
+                cwd=mod_dir,
+                capture_output=True, text=True, timeout=120,
+            )
+        else:
+            logger.info("worktree 预检: TypeScript 模块 %s 可用", mod_name)
 
 
 def _module_name(module) -> str:

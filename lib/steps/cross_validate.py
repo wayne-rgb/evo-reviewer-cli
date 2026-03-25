@@ -54,6 +54,7 @@ def run_cross_validate(state, project_root, modules_by_name):
             output_schema=FINDINGS_SCHEMA,
             max_turns=R5_MAX_TURNS,
             cwd=project_root,
+            timeout=600,  # R5 需要读代码验证，给充足时间
         )
     except Exception as e:
         logger.error(f"R5 扫描失败: {e}")

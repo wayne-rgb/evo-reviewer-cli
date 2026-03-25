@@ -27,6 +27,9 @@ def run_scan(state, project_root, modules):
     changed_by_module = getattr(state, "changed_by_module", {})
     boundary_context = getattr(state, "boundary_context", {})
     p0_context = getattr(state, "p0_context", [])
+    # 兼容旧版 state JSON（可能缺少 filtered_findings 字段）
+    if not hasattr(state, "filtered_findings") or state.filtered_findings is None:
+        state.filtered_findings = []
 
     all_findings = []
 

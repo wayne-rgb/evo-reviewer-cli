@@ -207,6 +207,7 @@ def _verify_single_bug(bug, wt, module, project_root):
             tools="",
             output_schema=CHECK_REASON_SCHEMA,
             max_turns=3,
+            timeout=60,  # 轻量判断，60s 足够
         )
     except Exception:
         reason = {"related": True, "reason": "无法判断，假设相关"}
@@ -327,6 +328,7 @@ def _run_module_checks(wt, module, project_root):
     from lib.claude import call_claude_session
     from lib.prompts.verify import FIX_REGRESSION_PROMPT
 
+    verify_timeout = module.estimate_timeout(project_root, task="verify")
     checks_ok = True
 
     if module.lint_command:
@@ -358,6 +360,7 @@ def _run_module_checks(wt, module, project_root):
                 tools="Read,Glob,Grep,Edit,Write",
                 max_turns=15,
                 cwd=wt.path,
+                timeout=verify_timeout,
             )
         except Exception as e:
             logger.error(f"修复回归失败: {e}")

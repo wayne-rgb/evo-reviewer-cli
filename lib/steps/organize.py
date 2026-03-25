@@ -23,6 +23,7 @@ def run_organize(state, project_root):
         tools="",
         output_schema=GAPS_SCHEMA,
         max_turns=5,
+        timeout=120,  # 归类无工具调用，120s 足够
     )
 
     if isinstance(result, dict):

@@ -55,7 +55,10 @@ class ModuleConfig:
         返回:
             超时秒数
         """
-        src_path = os.path.join(project_root, self.src_dir) if self.src_dir else ""
+        if not self.src_dir:
+            logger.warning("模块 %s 的 src_dir 未配置，使用最大超时 %ds", self.name, _TIMEOUT_MAX)
+            return _TIMEOUT_MAX
+        src_path = os.path.join(project_root, self.src_dir)
         file_count, total_bytes = _measure_source(src_path)
 
         total_kb = total_bytes / 1024.0
