@@ -81,6 +81,11 @@ def run_cross_validate(state, project_root, modules_by_name):
         or not is_impossible(f, modules_by_name[f["module"]].language)
     ]
 
+    # 全局 ID 分配，续接已有 findings
+    start_id = len(state.findings) + 1
+    for i, f in enumerate(findings, start_id):
+        f["id"] = f"F{i}"
+
     logger.info(f"R5 发现 {len(findings)} 个问题")
 
     # 预算检查

@@ -291,11 +291,11 @@ def _run_test(wt_path, bug, module):
     if module.language == "typescript":
         # 在模块目录下执行 vitest
         module_dir = os.path.join(wt_path, module.src_dir.rstrip("/").rsplit("/", 1)[0])
-        # test_file 是相对于模块根目录的路径
-        cmd = f"cd {module_dir} && npx vitest run {test_file}"
+        # test_file 是相对于模块根目录的路径，引号保护防止空格/特殊字符
+        cmd = f'cd "{module_dir}" && npx vitest run "{test_file}"'
     elif module.language == "go":
         pkg = os.path.dirname(bug.get("file", ""))
-        cmd = f"cd {wt_path} && go test -race ./{pkg}/"
+        cmd = f'cd "{wt_path}" && go test -race ./{pkg}/'
     elif module.language == "swift":
         cmd = _build_module_cmd(module.unit_command, wt_path, module) if module.unit_command else None
     else:
@@ -463,13 +463,13 @@ def _build_module_cmd(cmd_template, wt_path, module):
         original_dir = match.group(1)
         separator = match.group(2)
         rest = match.group(3)
-        # 在 worktree 中，模块目录的位置不变
+        # 在 worktree 中，模块目录的位置不变，引号保护路径
         new_dir = os.path.join(wt_path, original_dir)
-        return f"cd {new_dir} {separator} {rest}"
+        return f'cd "{new_dir}" {separator} {rest}'
 
     # 没有 cd 前缀，直接在 worktree 中执行
     module_dir = os.path.join(wt_path, module.src_dir.rstrip("/").rsplit("/", 1)[0])
-    return f"cd {module_dir} && {cmd_template}"
+    return f'cd "{module_dir}" && {cmd_template}'
 
 
 def _tail(data, n=50):

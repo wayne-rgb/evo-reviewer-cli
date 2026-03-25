@@ -82,9 +82,8 @@ def generate_confirm_report(gaps: list, findings: list) -> str:
 
             lines.append("")
 
-    # 汇总行
-    lines.append(f"以上 {total_gaps} 个盲区（涉及 {len(total_bugs)} 个 bug），确认后直接执行。")
-    lines.append("Enter 全部确认 / 输入编号排除 / q 退出: ")
+    # 汇总行（操作提示由 confirm.py 的 input() 负责，报告不重复）
+    lines.append(f"以上 {total_gaps} 个盲区，涉及 {len(total_bugs)} 个 bug。")
 
     return "\n".join(lines)
 

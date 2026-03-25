@@ -63,11 +63,5 @@ CROSS_SCAN_PROMPT = """你是代码审查专家，正在进行交叉检验。
 
 如果没有发现，返回空数组。"""
 
-BOOTSTRAP_SCAN_PROMPT = """扫描项目结构，生成模块配置。
-
-请检查以下目录的项目结构：
-- 查找 package.json / go.mod / *.xcodeproj 等项目文件
-- 确定每个模块的语言、源码目录、测试目录
-- 推断测试命令
-
-输出 JSON 格式的模块配置。"""
+# 注意：BOOTSTRAP_SCAN_PROMPT 的权威定义在 lib/prompts/scan.py 中。
+# bootstrap.py import 的是 scan.py 的版本。此处不再重复定义。

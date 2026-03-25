@@ -121,16 +121,29 @@ def _find_source(test_path):
     else:
         return None
 
-    # 在目录树中搜索
+    # 在目录树中搜索，限制范围防止遍历整个文件系统
     project_dir = test_path
     for _ in range(5):
-        project_dir = os.path.dirname(project_dir)
+        parent = os.path.dirname(project_dir)
+        if parent == project_dir:
+            break  # 已到根目录，停止上溯
+        project_dir = parent
+
+    # 排除的目录
+    skip_dirs = {
+        "node_modules", ".build", "Build", "DerivedData",
+        "__pycache__", ".git", "Pods", ".evo-review",
+    }
 
     for root, dirs, files in os.walk(project_dir):
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
         if source_name in files:
             path = os.path.join(root, source_name)
             if path != test_path:
-                with open(path, 'r') as f:
-                    return f.read()[:5000]  # 限制长度
+                try:
+                    with open(path, 'r') as f:
+                        return f.read()[:5000]  # 限制长度
+                except Exception:
+                    continue
 
     return None
