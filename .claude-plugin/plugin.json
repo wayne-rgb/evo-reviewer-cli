@@ -6,6 +6,5 @@
     "name": "wayne"
   },
   "repository": "https://github.com/wayne-rgb/evo-reviewer-cli",
-  "skills": "./skills/",
-  "hooks": "./hooks/hooks.json"
+  "skills": "./skills/"
 }
