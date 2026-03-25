@@ -47,13 +47,12 @@ def run_infra_c2(state, project_root):
         cwd=project_root,
     )
 
-    # commit + push
-    from lib.git import git_commit, git_push
+    # commit（push 统一在 _run_finalize 最后执行）
+    from lib.git import git_commit
     try:
         git_commit("Phase C-2: 文档 + 趋势治理 + 存量清理", cwd=project_root)
-        git_push(cwd=project_root)
     except Exception as e:
-        logger.warning(f"C-2 提交/推送失败: {e}")
+        logger.warning(f"C-2 提交失败: {e}")
 
     state.phase_c2_done = True
     logger.info("Phase C-2 完成")

@@ -116,6 +116,15 @@ def _run_finalize(state, project_root):
         state.advance("infra_c2")
         state.save(state.state_file(project_root))
 
+    # 统一 push（merge + C1 + C2 的所有 commit 一次推送）
+    if merged:
+        from lib.git import git_push
+        try:
+            git_push(cwd=project_root)
+            logger.info("统一推送完成")
+        except Exception as e:
+            logger.error(f"推送失败: {e}")
+
     # report
     print("\n=== 阶段 D：最终报告 ===\n")
     report = generate_final_report(state)
@@ -177,7 +186,21 @@ def cmd_review(args):
         return 0
 
     print("\n=== 阶段 1.5：盲区归类 ===\n")
-    gaps = run_organize(state, project_root)
+    try:
+        gaps = run_organize(state, project_root)
+    except Exception as e:
+        logger.error("盲区归类失败（降级为每个 finding 独立一个 gap）: %s", e)
+        state.gaps = [
+            {
+                "id": f"G{i}",
+                "module": f.get("module", "unknown"),
+                "gap_name": f.get("description", ""),
+                "infra_plan": f.get("infra_needed", "待定"),
+                "evidence_finding_ids": [f["id"]],
+            }
+            for i, f in enumerate(state.findings, 1)
+        ]
+        gaps = state.gaps
     print(f"归类为 {len(gaps)} 个盲区")
 
     state.advance("organize")
@@ -295,7 +318,21 @@ def cmd_deep(args):
         return 0
 
     print("\n=== 盲区归类 ===\n")
-    gaps = run_organize(state, project_root)
+    try:
+        gaps = run_organize(state, project_root)
+    except Exception as e:
+        logger.error("盲区归类失败（降级为每个 finding 独立一个 gap）: %s", e)
+        # 降级：每个 finding 独立成一个 gap，不影响后续流程
+        state.gaps = [
+            {
+                "id": f"G{i}",
+                "module": f.get("module", "unknown"),
+                "gap_name": f.get("description", ""),
+                "infra_plan": f.get("infra_needed", "待定"),
+                "evidence_finding_ids": [f["id"]],
+            }
+            for i, f in enumerate(state.findings, 1)
+        ]
 
     state.advance("organize")
     state.save(state.state_file(project_root))

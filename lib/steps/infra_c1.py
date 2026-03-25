@@ -75,13 +75,12 @@ def run_infra_c1(state, project_root):
     except Exception as e:
         logger.error(f"约束提取失败: {e}")
 
-    # commit + push
-    from lib.git import git_commit, git_push
+    # commit（push 统一在 _run_finalize 最后执行）
+    from lib.git import git_commit
     try:
         git_commit("Phase C-1: gate 规则 + helper", cwd=project_root)
-        git_push(cwd=project_root)
     except Exception as e:
-        logger.warning(f"C-1 提交/推送失败: {e}")
+        logger.warning(f"C-1 提交失败: {e}")
 
     state.phase_c1_done = True
     logger.info("Phase C-1 完成")

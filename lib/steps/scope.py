@@ -107,7 +107,7 @@ def _match_modules(paths, all_modules):
     for m in all_modules:
         for p in paths:
             # 路径前缀匹配
-            if p.startswith(m.src_dir) or m.src_dir.startswith(p) or m.name in p:
+            if p.startswith(m.src_dir) or m.src_dir.startswith(p) or m.name == p:
                 if m not in matched:
                     matched.append(m)
     return matched

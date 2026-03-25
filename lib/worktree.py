@@ -161,29 +161,12 @@ def merge_worktree(wt: Worktree, project_root: str) -> None:
         logger.info("已删除分支: %s", wt.branch)
 
 
-def revert_bug_files(wt_path: str, bug: dict) -> None:
-    """
-    回滚单个 bug 相关的文件改动。
-
-    当某个 bug 的修复被证实是幻觉时，需要回滚该 bug 在 worktree 中的改动。
-    当前实现：回滚 worktree 中所有未提交的改动（保守策略）。
-
-    参数:
-        wt_path: worktree 路径
-        bug: bug 信息字典（预留，未来可用于精确回滚特定文件）
-    """
-    logger.info("回滚 worktree %s 中的未提交改动", wt_path)
-    subprocess.run(
-        ["git", "checkout", "--", "."],
-        cwd=wt_path,
-        capture_output=True,
-        text=True,
-    )
-
-
 def commit_in_worktree(wt: Worktree, message: str) -> bool:
     """
-    在 worktree 中暂存所有改动并提交。
+    在 worktree 中暂存已修改和新增的源码文件并提交。
+
+    安全策略：只 add 已 tracked 的修改文件 + 排除危险文件的新文件，
+    避免 git add -A 意外提交 .env、编辑器备份等文件。
 
     参数:
         wt: Worktree 实例
@@ -192,14 +175,32 @@ def commit_in_worktree(wt: Worktree, message: str) -> bool:
     返回:
         True 表示有内容被提交，False 表示无改动（跳过提交）
     """
-    # 暂存所有改动
+    # 暂存已 tracked 的修改文件（安全：只 add 已跟踪文件的改动）
     subprocess.run(
-        ["git", "add", "-A"],
+        ["git", "add", "-u"],
         cwd=wt.path,
         check=True,
         capture_output=True,
         text=True,
     )
+
+    # 暂存新文件，但排除危险文件
+    _EXCLUDE = {".env", ".env.local", ".DS_Store"}
+    _EXCLUDE_EXT = {".bak", ".swp", ".swo", ".tmp"}
+    result = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=wt.path, capture_output=True, text=True,
+    )
+    new_files = [
+        f for f in result.stdout.strip().split("\n")
+        if f and os.path.basename(f) not in _EXCLUDE
+        and os.path.splitext(f)[1] not in _EXCLUDE_EXT
+    ]
+    if new_files:
+        subprocess.run(
+            ["git", "add", "--"] + new_files,
+            cwd=wt.path, capture_output=True, text=True,
+        )
 
     # 检查是否有待提交的内容
     result = subprocess.run(

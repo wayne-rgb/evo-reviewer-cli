@@ -110,15 +110,6 @@ def generate_verify_report(results: dict, findings: list) -> str:
     # 构建 finding 索引
     finding_index = {f.get("id"): f for f in findings if f.get("id")}
 
-    # 状态标记映射
-    status_marks = {
-        "verified": "pass",
-        "hallucination": "fail",
-        "fix_failed": "warn",
-        "unverified": "unknown",
-        "skipped": "skip",
-    }
-
     lines = []
     lines.append("## 验证结果")
     lines.append("")

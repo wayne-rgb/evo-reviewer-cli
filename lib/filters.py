@@ -51,7 +51,7 @@ KEYWORD_PATTERNS = {
         r"(?i)(actor\s*isolation|sendable|@MainActor\s*violation)"
     ),
     "data_race": re.compile(
-        r"(?i)(data\s*race|concurrent\s*access|simultaneous\s*access)"
+        r"(?i)(data\s*race|simultaneous\s*access)"
     ),
     "deadlock": re.compile(
         r"(?i)(deadlock|dead\s*lock|circular\s*wait)"

@@ -162,6 +162,9 @@ def _verify_single_bug(bug, wt, module, project_root):
     verify_timeout = module.estimate_timeout(project_root, task="verify")
     logger.info(f"[{bug_id}] 开始验证: {bug.get('file')}:{bug.get('line')} — {bug.get('description', '')[:60]}")
 
+    # 快照当前脏文件，用于精确回滚
+    pre_snap = _snapshot_dirty_files(wt.path)
+
     # 1. 写测试
     test_prompt = WRITE_TEST_PROMPT.format(
         bug_id=bug_id,
@@ -190,7 +193,7 @@ def _verify_single_bug(bug, wt, module, project_root):
 
     # 3. 测试通过 -> 幻觉
     if test_result["exit_code"] == 0:
-        _revert_changes(wt.path, bug)
+        _revert_changes(wt.path, bug, pre_snapshot=pre_snap)
         logger.info(f"[{bug_id}] 幻觉 — 测试直接通过")
         return {"status": "hallucination", "reason": "测试直接通过，bug 不存在"}
 
@@ -219,7 +222,7 @@ def _verify_single_bug(bug, wt, module, project_root):
             reason = {"related": True, "reason": reason}
 
     if not reason.get("related", True):
-        _revert_changes(wt.path, bug)
+        _revert_changes(wt.path, bug, pre_snapshot=pre_snap)
         logger.info(f"[{bug_id}] 幻觉 — {reason.get('reason', '')}")
         return {"status": "hallucination", "reason": reason.get("reason", "测试失败与 bug 无关")}
 
@@ -243,7 +246,7 @@ def _verify_single_bug(bug, wt, module, project_root):
         )
     except Exception as e:
         logger.error(f"[{bug_id}] 写修复失败: {e}")
-        _revert_changes(wt.path, bug)
+        _revert_changes(wt.path, bug, pre_snapshot=pre_snap)
         return {"status": "fix_failed", "reason": f"写修复失败: {e}"}
 
     # 6. CLI 跑测试
@@ -251,7 +254,7 @@ def _verify_single_bug(bug, wt, module, project_root):
 
     if fix_result["exit_code"] == 0:
         logger.info(f"[{bug_id}] 验证通过")
-        return {"status": "verified", "test_file": _guess_test_file(bug, module)}
+        return {"status": "verified", "test_file": _guess_test_file(bug, module, wt.path)}
 
     # 7. 重试一次
     logger.info(f"[{bug_id}] 修复后测试仍失败，重试")
@@ -272,15 +275,15 @@ def _verify_single_bug(bug, wt, module, project_root):
             timeout=verify_timeout,
         )
     except Exception as e:
-        _revert_changes(wt.path, bug)
+        _revert_changes(wt.path, bug, pre_snapshot=pre_snap)
         return {"status": "fix_failed", "reason": f"重试失败: {e}"}
 
     retry_result = _run_test(wt.path, bug, module)
     if retry_result["exit_code"] == 0:
         logger.info(f"[{bug_id}] 重试后验证通过")
-        return {"status": "verified", "test_file": _guess_test_file(bug, module)}
+        return {"status": "verified", "test_file": _guess_test_file(bug, module, wt.path)}
 
-    _revert_changes(wt.path, bug)
+    _revert_changes(wt.path, bug, pre_snapshot=pre_snap)
     logger.info(f"[{bug_id}] 修复失败")
     return {"status": "fix_failed", "reason": "重试后测试仍失败"}
 
@@ -366,44 +369,51 @@ def _run_module_checks(wt, module, project_root):
             logger.error(f"修复回归失败: {e}")
 
 
-def _revert_changes(wt_path, bug=None):
+def _snapshot_dirty_files(wt_path):
+    """快照 worktree 当前的脏文件（已修改 + 未跟踪），用于精确回滚。
+
+    在 claude session 前调用，记录"之前就有的脏文件"；
+    session 后对比 diff，差集就是该 session 产生的文件。
+    """
+    result = subprocess.run(
+        ["git", "diff", "--name-only"],
+        cwd=wt_path, capture_output=True, text=True,
+    )
+    modified = set(result.stdout.strip().split("\n")) if result.stdout.strip() else set()
+
+    result = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=wt_path, capture_output=True, text=True,
+    )
+    untracked = set(result.stdout.strip().split("\n")) if result.stdout.strip() else set()
+
+    return modified, untracked
+
+
+def _revert_changes(wt_path, bug=None, pre_snapshot=None):
     """回滚 worktree 中的改动。
 
-    如果有 bug 信息，只回滚该 bug 相关的文件（精确回滚）；
-    否则回滚所有未提交改动（全量回滚）。
-
-    精确回滚避免并发验证时互相干扰——不同文件的 bug 并行执行，
-    一个 bug 失败不应影响其他 bug 的改动。
+    优先使用 pre_snapshot 精确回滚（只回滚 session 新增/修改的文件）；
+    fallback 到 bug 文件名匹配；最后兜底全量回滚。
     """
-    if bug:
-        # 精确回滚：只回滚 bug 相关的文件
-        # 获取当前未提交的改动文件
+    if pre_snapshot:
+        # 精确模式：回滚 snapshot 之后新增的改动
+        pre_modified, pre_untracked = pre_snapshot
+
         result = subprocess.run(
             ["git", "diff", "--name-only"],
             cwd=wt_path, capture_output=True, text=True,
         )
-        changed = set(result.stdout.strip().split("\n")) if result.stdout.strip() else set()
+        cur_modified = set(result.stdout.strip().split("\n")) if result.stdout.strip() else set()
 
-        # 获取新增的未跟踪文件
         result = subprocess.run(
             ["git", "ls-files", "--others", "--exclude-standard"],
             cwd=wt_path, capture_output=True, text=True,
         )
-        untracked = set(result.stdout.strip().split("\n")) if result.stdout.strip() else set()
+        cur_untracked = set(result.stdout.strip().split("\n")) if result.stdout.strip() else set()
 
-        # 推断 bug 相关的文件模式
-        bug_file = bug.get("file", "")
-        bug_base = os.path.splitext(os.path.basename(bug_file))[0]
-
-        files_to_revert = []
-        files_to_remove = []
-
-        for f in changed:
-            if bug_base and bug_base in f:
-                files_to_revert.append(f)
-        for f in untracked:
-            if bug_base and bug_base in f:
-                files_to_remove.append(f)
+        files_to_revert = list(cur_modified - pre_modified)
+        files_to_remove = list(cur_untracked - pre_untracked)
 
         if files_to_revert:
             subprocess.run(
@@ -415,11 +425,45 @@ def _revert_changes(wt_path, bug=None):
             if os.path.exists(full):
                 os.remove(full)
 
-        if not files_to_revert and not files_to_remove:
-            # 找不到特定文件就全量回滚（兜底）
-            _revert_all(wt_path)
-    else:
-        _revert_all(wt_path)
+        if files_to_revert or files_to_remove:
+            logger.debug("精确回滚: revert %d, remove %d", len(files_to_revert), len(files_to_remove))
+            return
+
+    # fallback：基于 bug 文件名匹配（保留旧逻辑作为兜底）
+    if bug:
+        result = subprocess.run(
+            ["git", "diff", "--name-only"],
+            cwd=wt_path, capture_output=True, text=True,
+        )
+        changed = set(result.stdout.strip().split("\n")) if result.stdout.strip() else set()
+
+        result = subprocess.run(
+            ["git", "ls-files", "--others", "--exclude-standard"],
+            cwd=wt_path, capture_output=True, text=True,
+        )
+        untracked = set(result.stdout.strip().split("\n")) if result.stdout.strip() else set()
+
+        bug_file = bug.get("file", "")
+        bug_base = os.path.splitext(os.path.basename(bug_file))[0]
+
+        files_to_revert = [f for f in changed if bug_base and bug_base in f]
+        files_to_remove = [f for f in untracked if bug_base and bug_base in f]
+
+        if files_to_revert:
+            subprocess.run(
+                ["git", "checkout", "--"] + files_to_revert,
+                cwd=wt_path, capture_output=True, text=True,
+            )
+        for f in files_to_remove:
+            full = os.path.join(wt_path, f)
+            if os.path.exists(full):
+                os.remove(full)
+
+        if files_to_revert or files_to_remove:
+            return
+
+    # 最终兜底：全量回滚
+    _revert_all(wt_path)
 
 
 def _revert_all(wt_path):
@@ -434,13 +478,18 @@ def _revert_all(wt_path):
     )
 
 
-def _guess_test_file(bug, module=None):
+def _guess_test_file(bug, module=None, wt_path=None):
     """根据 bug 文件猜测对应的测试文件。
 
+    优先在 worktree 中 glob 搜索匹配的测试文件；
+    找不到时 fallback 到基于命名约定的猜测。
+
     返回相对于模块根目录的路径（不含模块名前缀）。
-    例如 bug 文件 togo-agent/src/ws/server.ts → src/__tests__/server.test.ts
     """
+    import glob as globmod
+
     file_path = bug.get("file", "")
+    module_prefix = ""
 
     # 去掉模块前缀（如 togo-agent/）
     if module and module.src_dir:
@@ -448,6 +497,24 @@ def _guess_test_file(bug, module=None):
         if file_path.startswith(module_prefix):
             file_path = file_path[len(module_prefix):]
 
+    basename_no_ext = os.path.splitext(os.path.basename(file_path))[0]
+
+    # 在 worktree 中搜索匹配的测试文件
+    if wt_path and module_prefix and basename_no_ext:
+        search_root = os.path.join(wt_path, module_prefix.rstrip("/"))
+        # 搜索模式：文件名含 basename 且含 test/Test
+        patterns = [
+            f"**/*{basename_no_ext}*.test.*",
+            f"**/*{basename_no_ext}*Test*",
+            f"**/*{basename_no_ext}*_test.*",
+        ]
+        for pat in patterns:
+            matches = globmod.glob(os.path.join(search_root, pat), recursive=True)
+            if matches:
+                # 返回相对于模块根的路径
+                return os.path.relpath(matches[0], search_root)
+
+    # fallback：命名约定
     # TypeScript: src/foo/bar.ts -> src/__tests__/bar.test.ts
     if file_path.endswith(".ts"):
         base = os.path.basename(file_path).replace(".ts", ".test.ts")

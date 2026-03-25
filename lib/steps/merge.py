@@ -62,15 +62,8 @@ def run_merge(state, project_root):
             merge_failed = True
 
     if merge_failed:
-        print("\n⚠️ 部分 worktree 合并失败，跳过 push。请手动检查 git 状态。")
+        print("\n⚠️ 部分 worktree 合并失败。请手动检查 git 状态。")
         return False
 
-    # push
-    from lib.git import git_push
-    try:
-        git_push(cwd=project_root)
-        logger.info("已推送")
-    except Exception as e:
-        logger.error(f"推送失败: {e}")
-
+    # push 统一在 _run_finalize 最后执行，此处不再单独 push
     return True

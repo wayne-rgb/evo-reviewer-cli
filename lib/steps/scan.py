@@ -247,6 +247,13 @@ def run_deep_r2(state, project_root, modules, r1_findings):
             except Exception as e:
                 logger.error(f"{m.name} R2 扫描失败: {e}")
 
+    # R1/R2 模糊去重：同文件 + 行号差 ≤5 + 描述相似 → 视为重复
+    before_dedup = len(r2_findings)
+    r2_findings = _dedup_findings(r1_findings, r2_findings)
+    dedup_count = before_dedup - len(r2_findings)
+    if dedup_count > 0:
+        logger.info("R2 去重：移除了 %d 个与 R1 重复的 finding", dedup_count)
+
     # 全局 ID，续接 R1
     start = len(state.findings) + 1
     for i, f in enumerate(r2_findings, start):
@@ -255,6 +262,39 @@ def run_deep_r2(state, project_root, modules, r1_findings):
     state.r2_findings = r2_findings
     state.findings.extend(r2_findings)
     return r2_findings
+
+
+def _dedup_findings(existing, new_findings):
+    """模糊去重：移除 new_findings 中与 existing 重复的条目。
+
+    重复判定：同文件 + 行号差 ≤ 5 + 描述词集重叠率 > 0.6
+    """
+    kept = []
+    for nf in new_findings:
+        nf_file = nf.get("file", "")
+        nf_line = nf.get("line", 0)
+        nf_words = set(nf.get("description", "").lower().split())
+
+        is_dup = False
+        for ef in existing:
+            if ef.get("file", "") != nf_file:
+                continue
+            if abs(ef.get("line", 0) - nf_line) > 5:
+                continue
+            ef_words = set(ef.get("description", "").lower().split())
+            if not nf_words or not ef_words:
+                continue
+            overlap = len(nf_words & ef_words) / max(len(nf_words | ef_words), 1)
+            if overlap > 0.6:
+                is_dup = True
+                logger.debug(
+                    "去重: R2 %s:%d 与 R1 %s:%d 重复（overlap=%.2f）",
+                    nf_file, nf_line, ef.get("file"), ef.get("line"), overlap,
+                )
+                break
+        if not is_dup:
+            kept.append(nf)
+    return kept
 
 
 def _extract_findings(result, module_name):
