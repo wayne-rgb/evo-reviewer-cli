@@ -27,7 +27,7 @@ def run_cross_validate(state, project_root, modules_by_name):
     # 已验证的 bug 摘要
     verified = [
         f for f in state.findings
-        if state.results.get(f["id"], {}).get("status") == "verified"
+        if state.get_result_status(f["id"]) == "verified"
     ]
     verified_summary = "\n".join(
         f"- [{f['id']}] {f.get('file')}:{f.get('line')} — {f.get('description', '')}"
@@ -36,9 +36,9 @@ def run_cross_validate(state, project_root, modules_by_name):
 
     # 新增测试模式
     test_patterns = "\n".join(
-        f"- {state.results[f['id']].get('test_file', '?')}"
+        f"- {state.get_result_field(f['id'], 'test_file', '?')}"
         for f in verified
-        if state.results.get(f["id"], {}).get("test_file")
+        if state.get_result_field(f["id"], "test_file")
     ) or "无新增测试"
 
     prompt = CROSS_SCAN_PROMPT.format(
@@ -121,7 +121,7 @@ def run_cross_validate(state, project_root, modules_by_name):
 
         # 有 verified 的修复就合并
         has_verified = any(
-            state.results.get(f["id"], {}).get("status") == "verified"
+            state.get_result_status(f["id"]) == "verified"
             for f in bugs_to_verify
         )
         if has_verified:

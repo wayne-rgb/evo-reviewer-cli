@@ -20,7 +20,7 @@ def run_infra_c1(state, project_root):
 
     verified = [
         f for f in state.findings
-        if state.results.get(f["id"], {}).get("status") == "verified"
+        if state.get_result_status(f["id"]) == "verified"
     ]
 
     if not verified:

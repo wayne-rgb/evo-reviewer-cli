@@ -290,8 +290,7 @@ def cmd_resume(args):
         confirmed_ids = [
             f["id"] for f in state.findings
             if f["id"] not in state.results
-            or (isinstance(state.results.get(f["id"]), dict)
-                and state.results[f["id"]].get("status") == "fix_failed")
+            or state.get_result_status(f["id"]) == "fix_failed"
         ]
         if confirmed_ids:
             from lib.steps.verify import run_verify
@@ -363,8 +362,8 @@ def _load_trend(state, project_root):
                     state.high_freq_rules.append(parts[1])
                 elif in_files and count >= 3:
                     state.hot_files.append(parts[1])
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"加载违规趋势失败（非关键）: {e}")
 
 
 def _self_check(state):
@@ -384,9 +383,8 @@ def _self_check(state):
 
     # 3. Phase C 完成状态
     has_verified = any(
-        (r.get("status") if isinstance(r, dict) else getattr(r, "status", ""))
-        == "verified"
-        for r in state.results.values()
+        state.get_result_status(fid) == "verified"
+        for fid in state.results
     )
     if has_verified:
         if not state.phase_c1_done:

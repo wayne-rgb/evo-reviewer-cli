@@ -120,7 +120,7 @@ def _verify_module(state, project_root, mod_name, bugs, wt, module):
 
     # commit worktree（只含 verified 和 unverified 的改动）
     has_verified = any(
-        state.results.get(b["id"], {}).get("status") == "verified"
+        state.get_result_status(b["id"]) == "verified"
         for b in active_bugs
     )
     if has_verified:
@@ -275,7 +275,7 @@ def _verify_single_bug(bug, wt, module, project_root):
         logger.info(f"[{bug_id}] 重试后验证通过")
         return {"status": "verified", "test_file": _guess_test_file(bug, module)}
 
-    _revert_changes(wt.path)
+    _revert_changes(wt.path, bug)
     logger.info(f"[{bug_id}] 修复失败")
     return {"status": "fix_failed", "reason": "重试后测试仍失败"}
 

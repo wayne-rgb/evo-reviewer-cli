@@ -15,8 +15,8 @@ def run_merge(state, project_root):
 
     # 统计
     verified_count = sum(
-        1 for r in state.results.values()
-        if (r.get("status") if isinstance(r, dict) else r) == "verified"
+        1 for fid in state.results
+        if state.get_result_status(fid) == "verified"
     )
 
     if verified_count == 0:

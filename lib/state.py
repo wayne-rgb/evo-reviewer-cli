@@ -84,6 +84,8 @@ class ReviewState:
     overflow: list = field(default_factory=list)
     high_freq_rules: list = field(default_factory=list)
     hot_files: list = field(default_factory=list)
+    # 跨模块架构约束（infra_c1 写入）
+    constraints: list = field(default_factory=list)
     # 边界展开（scope 阶段写入）
     changed_by_module: dict = field(default_factory=dict)   # {模块名: [变更文件列表]}
     boundary_context: dict = field(default_factory=dict)    # {模块名: {boundary_files, counterpart_files, protocols}}
@@ -121,7 +123,30 @@ class ReviewState:
                 results[k] = v
         data["results"] = results
 
+        # 过滤掉 ReviewState 不认识的字段（兼容旧版/新版 state JSON）
+        import dataclasses
+        valid_fields = {f.name for f in dataclasses.fields(cls)}
+        data = {k: v for k, v in data.items() if k in valid_fields}
+
         return cls(**data)
+
+    def get_result_status(self, finding_id: str) -> str:
+        """安全读取 finding 的验证状态，兼容 dict 和 BugResult 两种存储格式。"""
+        r = self.results.get(finding_id)
+        if r is None:
+            return ""
+        if isinstance(r, dict):
+            return r.get("status", "")
+        return getattr(r, "status", "")
+
+    def get_result_field(self, finding_id: str, field: str, default="") -> str:
+        """安全读取 finding 验证结果的任意字段，兼容 dict 和 BugResult。"""
+        r = self.results.get(finding_id)
+        if r is None:
+            return default
+        if isinstance(r, dict):
+            return r.get(field, default)
+        return getattr(r, field, default)
 
     def advance(self, phase) -> None:
         """推进到指定阶段。接受 Phase 枚举或字符串。"""

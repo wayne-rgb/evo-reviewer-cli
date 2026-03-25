@@ -61,11 +61,18 @@ def git_diff_files(n: int = 5, cwd: Optional[str] = None) -> list:
         return []
 
     if actual_count < n:
-        # commit 不足 n 个，用 --root 获取所有文件
-        output = _run_git(
-            ["diff", "--name-only", "--diff-filter=ACMRT", "HEAD~" + str(actual_count - 1)],
-            cwd=cwd, check=False,
-        )
+        if actual_count == 1:
+            # 仅一个 commit：用 diff-tree 获取该 commit 引入的文件
+            output = _run_git(
+                ["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+                cwd=cwd, check=False,
+            )
+        else:
+            # commit 不足 n 个，比较最早 commit 到 HEAD
+            output = _run_git(
+                ["diff", "--name-only", "--diff-filter=ACMRT", "HEAD~" + str(actual_count - 1)],
+                cwd=cwd, check=False,
+            )
         if not output:
             # fallback: 列出所有 tracked 文件
             output = _run_git(["ls-files"], cwd=cwd, check=False)
