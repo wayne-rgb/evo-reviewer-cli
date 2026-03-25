@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""evo-cli — 自进化代码审查 CLI
+
+用法：
+  evo-cli review [路径...]       最近 5 commit 范围审查
+  evo-cli deep [模块...]         全模块深度审查
+  evo-cli test-check <测试文件>  测试维度检查
+  evo-cli ci                     CI 验证
+  evo-cli resume                 中断恢复
+"""
+
+import sys
+import os
+
+# 将 CLI 根目录加入 Python 路径
+CLI_ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, CLI_ROOT)
+
+from lib.cli import main
+
+if __name__ == "__main__":
+    sys.exit(main())

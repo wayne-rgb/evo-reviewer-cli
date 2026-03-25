@@ -1,0 +1,27 @@
+{
+  "name": "evo-review",
+  "version": "2.0.0",
+  "description": "自进化代码审查 — CLI 驱动版",
+  "commands": [
+    {
+      "name": "review",
+      "description": "自进化代码审查：红绿验证对抗幻觉 + 门禁自动进化",
+      "file": "commands/review.md"
+    },
+    {
+      "name": "deep",
+      "description": "全模块深度审查：多轮扫描→红绿验证→交叉检验→基础设施强化",
+      "file": "commands/deep.md"
+    },
+    {
+      "name": "test-check",
+      "description": "检查测试文件的维度覆盖质量",
+      "file": "commands/test-check.md"
+    },
+    {
+      "name": "ci",
+      "description": "CI 验证 — 按改动范围选择测试粒度",
+      "file": "commands/ci.md"
+    }
+  ]
+}

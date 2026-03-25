@@ -1,0 +1,12 @@
+{
+  "hooks": [
+    {
+      "event": "PostToolUse",
+      "matcher": {
+        "tool_name": "Bash",
+        "output_contains": "To github.com"
+      },
+      "script": "plugin/hooks/post-push-signal.sh"
+    }
+  ]
+}
