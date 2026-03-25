@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if echo \"$CLAUDE_TOOL_OUTPUT\" | grep -q 'To github.com'; then echo '[evo-review] git push 检测到，建议执行 /ci 验证'; fi",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
