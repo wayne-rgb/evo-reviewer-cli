@@ -1,11 +1,13 @@
 {
   "name": "evo-reviewer-cli",
-  "description": "evo-review 插件市场",
+  "owner": {
+    "name": "wayne"
+  },
   "plugins": [
     {
       "name": "evo-cli",
       "description": "自进化代码审查 — 红绿验证对抗幻觉 + 门禁自动进化",
-      "source": "."
+      "source": "./."
     }
   ]
 }
