@@ -17,13 +17,17 @@ def run_organize(state, project_root):
 
     findings_json = json.dumps(state.findings, ensure_ascii=False, indent=2)
 
+    # 动态超时：基础 60s + 每个 finding 5s，下限 180s 上限 600s
+    timeout = min(600, max(180, 60 + len(state.findings) * 5))
+    logger.info("organize 超时: %ds（%d 个 findings）", timeout, len(state.findings))
+
     result = call_claude_bare(
         prompt=ORGANIZE_PROMPT.format(findings_json=findings_json),
         model="opus",
         tools="",
         output_schema=GAPS_SCHEMA,
         max_turns=5,
-        timeout=120,  # 归类无工具调用，120s 足够
+        timeout=timeout,
     )
 
     if isinstance(result, dict):

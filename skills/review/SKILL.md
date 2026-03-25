@@ -5,37 +5,65 @@ argument-hint: "[路径...]"
 allowed-tools: Bash, Read
 ---
 
-执行自进化代码审查。evo-cli 内部会调用多个 claude 子进程，整个流程可能持续 30+ 分钟，必须后台运行。
+使用 evo-cli 分阶段执行代码审查。每个阶段完成后汇报进度给用户。
 
-## 步骤
-
-1. 后台启动 evo-cli，日志写入文件：
+## 变量
 
 ```bash
 EVO_CLI="${CLAUDE_SKILL_DIR}/../../evo-cli"
-LOG_FILE=".evo-review/review-$(date +%Y%m%d-%H%M%S).log"
-mkdir -p .evo-review
-nohup "$EVO_CLI" review $ARGUMENTS > "$LOG_FILE" 2>&1 &
-EVO_PID=$!
-echo "evo-cli 已启动（PID: $EVO_PID），日志：$LOG_FILE"
-echo "$EVO_PID" > .evo-review/evo.pid
 ```
 
-2. 告知用户已启动，然后定期用 `tail` 查看进度：
+## 流程
+
+### 阶段 1：扫描
+
+后台运行扫描（内部调 claude 子进程，可能 5-10 分钟）：
 
 ```bash
-tail -30 "$LOG_FILE"
+"$EVO_CLI" review --until scan $ARGUMENTS
 ```
 
-3. 检查进程是否还在运行：
+用 `run_in_background: true` 执行。完成后读取输出，向用户汇报：
+- 发现了多少问题
+- 问题按模块和盲区的分布
+- 每个 finding 的 ID、严重级别、文件位置、描述
+
+### 阶段 2：用户确认
+
+将扫描结果的确认清单展示给用户，询问：
+- **全部确认**：直接进入验证
+- **排除部分**：用户指定要排除的 finding ID（如 "排除 F3,F5"）
+
+根据用户选择构造 `--confirmed` 参数。如果用户全部确认，不需要 `--confirmed`。
+
+### 阶段 3：红绿验证
+
+后台运行验证（每个 bug 独立调 claude 写测试+修复，可能 10-30 分钟）：
 
 ```bash
-if kill -0 $(cat .evo-review/evo.pid) 2>/dev/null; then echo "仍在运行"; else echo "已完成"; fi
+# 全部确认
+"$EVO_CLI" resume --until verify
+
+# 排除了部分 finding
+"$EVO_CLI" resume --confirmed "F1,F2,F4" --until verify
 ```
 
-4. 流程完成后，读取完整日志展示最终报告。
+用 `run_in_background: true` 执行。完成后向用户汇报：
+- 验证通过（verified）的数量和详情
+- 幻觉（hallucination）的数量
+- 修复失败（fix_failed）的数量
+
+### 阶段 4：收尾
+
+```bash
+"$EVO_CLI" resume
+```
+
+用 `run_in_background: true` 执行。完成后展示最终报告。
 
 ## 注意
-- 阶段 2（确认清单）需要用户交互输入，evo-cli 会在 stdin 等待。后台模式下直接 echo 空行自动全部确认：
-  `echo "" | "$EVO_CLI" review $ARGUMENTS` 可跳过交互，但会失去排除 bug 的机会。
-- 如果用户需要交互式选择，建议在终端直接运行：`"$EVO_CLI" review`
+
+- 每个阶段用 `run_in_background: true` 运行，完成后自动收到通知
+- 阶段 2（确认）是唯一需要用户交互的环节，在 Claude 侧完成，不需要 evo-cli 的 stdin
+- 如果任何阶段失败，读取输出分析原因，向用户汇报后决定是否重试
+- 超时建议：scan 600s，verify 1800s，finalize 600s

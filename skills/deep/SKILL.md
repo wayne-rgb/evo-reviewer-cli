@@ -5,36 +5,60 @@ argument-hint: "[模块...]"
 allowed-tools: Bash, Read
 ---
 
-执行全模块深度审查。evo-cli 内部会调用多个 claude 子进程，整个流程可能持续 60+ 分钟，必须后台运行。
+使用 evo-cli 分阶段执行全模块深度审查。每个阶段完成后汇报进度给用户。
 
-## 步骤
-
-1. 后台启动 evo-cli，日志写入文件：
+## 变量
 
 ```bash
 EVO_CLI="${CLAUDE_SKILL_DIR}/../../evo-cli"
-LOG_FILE=".evo-review/deep-$(date +%Y%m%d-%H%M%S).log"
-mkdir -p .evo-review
-nohup "$EVO_CLI" deep $ARGUMENTS > "$LOG_FILE" 2>&1 &
-EVO_PID=$!
-echo "evo-cli deep 已启动（PID: $EVO_PID），日志：$LOG_FILE"
-echo "$EVO_PID" > .evo-review/evo.pid
 ```
 
-2. 告知用户已启动，然后定期用 `tail` 查看进度：
+## 流程
+
+### 阶段 1：双轮扫描
+
+后台运行扫描（R1 标准 + R2 深度，可能 10-20 分钟）：
 
 ```bash
-tail -30 "$LOG_FILE"
+"$EVO_CLI" deep --until scan $ARGUMENTS
 ```
 
-3. 检查进程是否还在运行：
+用 `run_in_background: true` 执行。完成后向用户汇报：
+- R1 和 R2 分别发现了多少问题
+- 问题按模块和盲区的分布
+- 每个 finding 的 ID、严重级别、文件位置、描述
+
+### 阶段 2：用户确认
+
+将确认清单展示给用户，询问：
+- **全部确认**：直接进入验证
+- **排除部分**：用户指定要排除的 finding ID
+
+### 阶段 3：红绿验证 + 交叉检验
+
+后台运行验证（R4 红绿 + R5 交叉，可能 15-40 分钟）：
 
 ```bash
-if kill -0 $(cat .evo-review/evo.pid) 2>/dev/null; then echo "仍在运行"; else echo "已完成"; fi
+# 全部确认
+"$EVO_CLI" resume --until verify
+
+# 排除了部分
+"$EVO_CLI" resume --confirmed "F1,F2,F4" --until verify
 ```
 
-4. 流程完成后，读取完整日志展示最终报告。
+用 `run_in_background: true` 执行。完成后汇报验证结果。
+
+### 阶段 4：收尾
+
+```bash
+"$EVO_CLI" resume
+```
+
+用 `run_in_background: true` 执行。完成后展示最终报告。
 
 ## 注意
-- 阶段 2（确认清单）需要用户交互输入。后台模式下 stdin 关闭会自动跳过确认（全部接受）。
-- 如果用户需要交互式排除特定 bug，建议在终端直接运行。
+
+- 每个阶段用 `run_in_background: true` 运行，完成后自动收到通知
+- deep 的 verify 阶段包含 R5 交叉检验，比 review 多一步
+- 阶段 2（确认）在 Claude 侧完成用户交互
+- 超时建议：scan 1200s，verify 2400s，finalize 600s
