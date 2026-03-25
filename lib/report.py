@@ -343,6 +343,21 @@ def generate_final_report(state) -> str:
     else:
         lines.append("无幻觉记录。")
 
+    # ---- 被语言过滤器过滤的 findings（审计） ----
+    filtered = _get_state_field(state, "filtered_findings", [])
+    if filtered:
+        lines.append("")
+        lines.append("### 被语言运行时过滤器排除的 findings（审计）")
+        lines.append("")
+        lines.append("| # | 模块 | 类别 | 文件 | 描述 |")
+        lines.append("|---|------|------|------|------|")
+        for i, f in enumerate(filtered, 1):
+            lines.append(
+                f"| {i} | {f.get('module', '?')} | {f.get('category', '?')} "
+                f"| {f.get('file', '?')}:{f.get('line', '?')} "
+                f"| {f.get('description', '?')[:80]} |"
+            )
+
     return "\n".join(lines)
 
 

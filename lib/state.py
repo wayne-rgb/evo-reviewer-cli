@@ -90,6 +90,8 @@ class ReviewState:
     changed_by_module: dict = field(default_factory=dict)   # {模块名: [变更文件列表]}
     boundary_context: dict = field(default_factory=dict)    # {模块名: {boundary_files, counterpart_files, protocols}}
     p0_context: list = field(default_factory=list)          # [{case_id, keyword, scope}]
+    # 被语言运行时过滤器过滤的 findings（审计用）
+    filtered_findings: list = field(default_factory=list)
     # 深度 review 专用
     r2_findings: list = field(default_factory=list)
     r5_findings: list = field(default_factory=list)

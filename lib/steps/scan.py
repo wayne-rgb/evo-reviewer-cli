@@ -21,7 +21,7 @@ def run_scan(state, project_root, modules):
         SCAN_PROMPT, BOUNDARY_SECTION_TEMPLATE, P0_SECTION_TEMPLATE,
     )
     from lib.schemas.findings import FINDINGS_SCHEMA
-    from lib.filters import get_runtime_facts, is_impossible
+    from lib.filters import get_runtime_facts, filter_findings
 
     # 从 state 获取边界展开信息（scope.py 已写入）
     changed_by_module = getattr(state, "changed_by_module", {})
@@ -56,12 +56,15 @@ def run_scan(state, project_root, modules):
                 result = future.result()
                 findings = _extract_findings(result, m.name)
 
-                # 过滤不可能的 bug
-                before = len(findings)
-                findings = [f for f in findings if not is_impossible(f, m.language)]
-                filtered = before - len(findings)
-                if filtered > 0:
-                    logger.info(f"{m.name}: 过滤了 {filtered} 个不可能的 bug")
+                # 过滤不可能的 bug，保留审计记录
+                findings, filtered_out = filter_findings(findings, m.language)
+                if filtered_out:
+                    state.filtered_findings.extend(filtered_out)
+                    logger.info(
+                        "%s: 过滤了 %d 个不可能的 bug: %s",
+                        m.name, len(filtered_out),
+                        ", ".join(f.get("id", "?") for f in filtered_out),
+                    )
 
                 logger.info(f"{m.name}: 发现 {len(findings)} 个问题")
                 all_findings.extend(findings)
@@ -166,7 +169,7 @@ def run_deep_r2(state, project_root, modules, r1_findings):
     from lib.claude import call_claude_bare
     from lib.prompts.scan import DEEP_R2_PROMPT, BOUNDARY_SECTION_TEMPLATE
     from lib.schemas.findings import FINDINGS_SCHEMA
-    from lib.filters import is_impossible
+    from lib.filters import filter_findings
 
     changed_by_module = getattr(state, "changed_by_module", {})
     boundary_context = getattr(state, "boundary_context", {})
@@ -228,7 +231,9 @@ def run_deep_r2(state, project_root, modules, r1_findings):
             try:
                 result = future.result()
                 findings = _extract_findings(result, m.name)
-                findings = [f for f in findings if not is_impossible(f, m.language)]
+                findings, filtered_out = filter_findings(findings, m.language)
+                if filtered_out:
+                    state.filtered_findings.extend(filtered_out)
 
                 if len(findings) == 0:
                     logger.info(f"{m.name}: R2 无新发现，提前终止")

@@ -96,7 +96,9 @@ def create_worktree(name: str, project_root: str) -> Worktree:
     )
     logger.debug("git worktree add 输出: %s", result.stdout.strip())
 
-    return Worktree(path=path, branch=branch, modules=[name])
+    wt = Worktree(path=path, branch=branch, modules=[name])
+    _precheck_worktree(wt, project_root)
+    return wt
 
 
 def remove_worktree(path: str, project_root: str) -> None:
@@ -284,6 +286,54 @@ def _get_xcode_project(module, project_root: str) -> Optional[str]:
             return os.path.join(parent, item)
 
     return None
+
+
+def _precheck_worktree(wt: Worktree, project_root: str) -> None:
+    """worktree 创建后的环境预检。
+
+    按语言检测常见问题：
+    - Go: 确保 go.mod 可被识别（go list），防止 "cannot find main module"
+    - TypeScript: 如果有 package.json 但无 node_modules，跑 npm install
+    - Swift: 无需特殊处理（Xcode 自动管理）
+
+    预检失败只记 warning，不阻塞流程。
+    """
+    from lib.config import ModuleConfig
+
+    for mod_name in wt.modules:
+        # 检查 worktree 中的子目录
+        # Go 模块检查
+        go_mod = os.path.join(wt.path, mod_name, "go.mod")
+        if not os.path.exists(go_mod):
+            go_mod = os.path.join(wt.path, "go.mod")
+        if os.path.exists(go_mod):
+            mod_dir = os.path.dirname(go_mod)
+            result = subprocess.run(
+                ["go", "list", "./..."],
+                cwd=mod_dir,
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode != 0:
+                logger.warning(
+                    "worktree 预检: Go 模块 %s 的 go list 失败: %s",
+                    mod_name, result.stderr[:200],
+                )
+            else:
+                logger.info("worktree 预检: Go 模块 %s 可用", mod_name)
+
+        # TypeScript 模块检查
+        pkg_json = os.path.join(wt.path, mod_name, "package.json")
+        if os.path.exists(pkg_json):
+            node_modules = os.path.join(wt.path, mod_name, "node_modules")
+            if not os.path.isdir(node_modules):
+                logger.info("worktree 预检: %s 缺少 node_modules，执行 npm install", mod_name)
+                subprocess.run(
+                    ["npm", "install", "--prefer-offline", "--no-audit"],
+                    cwd=os.path.dirname(pkg_json),
+                    capture_output=True, text=True, timeout=120,
+                )
+            else:
+                logger.info("worktree 预检: TypeScript 模块 %s 可用", mod_name)
 
 
 def _module_name(module) -> str:

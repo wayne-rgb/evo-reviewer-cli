@@ -21,18 +21,15 @@ logger = logging.getLogger(__name__)
 # 键为语言标识，值为在该语言中不可能存在的 bug 类别列表
 IMPOSSIBLE_CATEGORIES = {
     "typescript": [
-        "concurrency",      # 线程级并发
+        # 仅过滤线程级并发（Node.js 单线程），保留异步逻辑竞态
         "toctou",           # 检查-使用竞态（需要线程）
-        "race_condition",   # 线程竞态
-        "thread_safety",    # 线程安全
-        "data_race",        # 数据竞争
+        "data_race",        # 数据竞争（线程级）
         "deadlock",         # 死锁
         "mutex",            # 互斥锁
     ],
     "javascript": [
-        # 与 TypeScript 相同的运行时约束
-        "concurrency", "toctou", "race_condition", "thread_safety",
-        "data_race", "deadlock", "mutex",
+        # 与 TypeScript 相同
+        "toctou", "data_race", "deadlock", "mutex",
     ],
     "swift_mainactor": [
         # @MainActor 修饰的类自动隔离到主线程
