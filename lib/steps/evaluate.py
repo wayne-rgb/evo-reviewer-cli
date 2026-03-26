@@ -46,10 +46,17 @@ def run_evaluate(state, project_root, confirmed_ids, modules_by_name):
                 continue
 
             findings_json = json.dumps(findings, ensure_ascii=False, indent=2)
+
+            # 构建跨模块上下文（从 state 的 boundary_context 获取）
+            cross_section = _build_cross_module_section(
+                mod_name, state, modules_by_name
+            )
+
             prompt = EVALUATE_PROMPT.format(
                 module_name=mod_name,
                 language=module.language,
                 findings_json=findings_json,
+                cross_module_section=cross_section,
             )
             timeout = module.estimate_timeout(project_root, task="scan")
             future = pool.submit(
@@ -131,3 +138,49 @@ def _summarize_verdicts(evaluations):
         v = ev.get("verdict", "unknown")
         counts[v] = counts.get(v, 0) + 1
     return ", ".join(f"{v}={c}" for v, c in sorted(counts.items()))
+
+
+def _build_cross_module_section(mod_name, state, modules_by_name):
+    """构建跨模块上下文段落。
+
+    从 state.boundary_context 获取本模块的对端模块信息，
+    帮助评估时判断"对端是否有保护能阻止本模块 bug 被触发"。
+    """
+    from lib.prompts.evaluate import CROSS_MODULE_SECTION, NO_CROSS_MODULE_SECTION
+
+    boundary_context = getattr(state, "boundary_context", {})
+    boundary_info = boundary_context.get(mod_name)
+    if not boundary_info:
+        return NO_CROSS_MODULE_SECTION
+
+    # 收集对端模块信息
+    counterpart_files = boundary_info.get("counterpart_files", {})
+    protocols = boundary_info.get("protocols", [])
+
+    if not counterpart_files:
+        return NO_CROSS_MODULE_SECTION
+
+    # 构建跨模块信息文本
+    lines = []
+    if protocols:
+        lines.append(f"通信协议：{', '.join(protocols)}")
+
+    # 按对端模块分组
+    counterpart_modules = set()
+    for bf, cps in counterpart_files.items():
+        for cp in cps:
+            # 从文件路径推断模块名
+            for other_name, other_mod in modules_by_name.items():
+                if other_name != mod_name and other_mod.src_dir and cp.startswith(other_mod.src_dir):
+                    counterpart_modules.add(other_name)
+                    lines.append(f"- 本端 `{bf}` ↔ 对端 `{cp}`（{other_name} 模块）")
+                    break
+
+    if not lines:
+        return NO_CROSS_MODULE_SECTION
+
+    cross_info = "\n".join(lines)
+    return CROSS_MODULE_SECTION.format(
+        module_name=mod_name,
+        cross_module_info=cross_info,
+    )

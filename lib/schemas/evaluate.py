@@ -17,19 +17,27 @@ EVALUATE_SCHEMA = {
                     "trigger_probability": {
                         "type": "string",
                         "enum": ["high", "medium", "low", "near_zero"],
-                        "description": "触发概率"
+                        "description": "触发概率等级"
+                    },
+                    "trigger_scenario": {
+                        "type": "string",
+                        "description": "触发所需的具体用户操作序列（如：用户录音→语音识别超时→再次点录音按钮）"
                     },
                     "user_impact": {
                         "type": "string",
-                        "description": "触发后用户感知到的影响（一句话）"
+                        "description": "触发后用户感知到的影响"
                     },
-                    "self_healing": {
+                    "existing_protection": {
                         "type": "string",
-                        "description": "系统是否有自愈机制（一句话）"
+                        "description": "同代码库中是否有同类保护模式？此处是否遗漏？对端模块是否有兜底？"
+                    },
+                    "derivative_impact": {
+                        "type": "string",
+                        "description": "衍生影响链：bug 触发后的错误状态是否阻塞后续操作？比原始描述更严重吗？"
                     },
                     "reason": {
                         "type": "string",
-                        "description": "判定理由（含衍生影响分析）"
+                        "description": "最终判定理由（综合以上所有分析）"
                     },
                     "actual_severity": {
                         "type": "string",
@@ -37,7 +45,7 @@ EVALUATE_SCHEMA = {
                         "description": "重新评估后的实际严重度"
                     }
                 },
-                "required": ["id", "verdict", "trigger_probability", "user_impact", "reason", "actual_severity"]
+                "required": ["id", "verdict", "trigger_probability", "trigger_scenario", "user_impact", "derivative_impact", "reason", "actual_severity"]
             }
         }
     },
