@@ -1,6 +1,6 @@
 {
   "name": "evo-cli",
-  "version": "2.3.0",
+  "version": "2.4.0",
   "description": "自进化代码审查 — 红绿验证对抗幻觉 + 门禁自动进化",
   "author": {
     "name": "wayne"

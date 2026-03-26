@@ -403,11 +403,13 @@ def cmd_deep(args):
     # --- R4：红绿验证 ---
     print("\n=== R4：红绿验证 ===\n")
     run_verify(state, project_root, ids_to_verify, modules_by_name)
+    state.advance("verify")
     state.save(state.state_file(project_root))
 
     # --- R5：交叉检验 ---
     print("\n=== R5：交叉检验（轻量） ===\n")
     run_cross_validate(state, project_root, modules_by_name)
+    state.advance("cross_validate")
     state.save(state.state_file(project_root))
     _print_verify_summary(state)
 
@@ -537,8 +539,37 @@ def cmd_resume(args):
 
         phase = "verify"  # fall through
 
+    # --- evaluate 阶段：deep 模式的 R3 深度评估后 resume ---
+    if phase == "evaluate":
+        # R3 已完成（advance 到 evaluate 后崩溃），直接进入 verify
+        # 过滤掉 eval_skipped 的 findings
+        already_skipped = {
+            fid for fid, r in state.results.items()
+            if (r.get("status") if isinstance(r, dict) else getattr(r, "status", "")) == "eval_skipped"
+        }
+        remaining = [
+            f["id"] for f in state.findings
+            if f["id"] not in state.results or f["id"] not in already_skipped
+        ]
+        if remaining:
+            print(f"\n=== R4：红绿验证（{len(remaining)} 个 bug，{len(already_skipped)} 个已被 R3 跳过） ===\n")
+            from lib.steps.verify import run_verify
+            run_verify(state, project_root, remaining, modules_by_name)
+            state.save(state.state_file(project_root))
+        else:
+            print("所有 findings 已被 R3 评估跳过，无需红绿验证。")
+
+        if state.command == "deep":
+            print("\n=== R5：交叉检验（轻量） ===\n")
+            from lib.steps.cross_validate import run_cross_validate
+            run_cross_validate(state, project_root, modules_by_name)
+            state.save(state.state_file(project_root))
+
+        _print_verify_summary(state)
+        phase = "verify"  # fall through
+
     # --- verify 阶段：可能有未完成的验证，然后收尾 ---
-    if phase == "verify":
+    if phase in ("verify", "cross_validate"):
         # 检查是否有未验证的 bug
         unverified = [
             f["id"] for f in state.findings

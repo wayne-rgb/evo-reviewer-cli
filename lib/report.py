@@ -301,12 +301,14 @@ def generate_final_report(state) -> str:
     lines.append("")
     lines.append("### 验证统计")
     lines.append("")
-    lines.append("| 发现数 | 已验证 | 幻觉 | 未验证 |")
-    lines.append("|--------|--------|------|--------|")
+    lines.append("| 发现数 | 已验证 | 幻觉 | 修复失败 | 评估跳过 | 未验证 |")
+    lines.append("|--------|--------|------|----------|----------|--------|")
     lines.append(
         f"| {stats['total']} "
         f"| {stats['verified']} "
         f"| {stats['hallucination']} "
+        f"| {stats['fix_failed']} "
+        f"| {stats['eval_skipped']} "
         f"| {stats['unverified']} |"
     )
 
