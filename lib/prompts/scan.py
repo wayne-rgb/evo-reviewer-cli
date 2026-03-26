@@ -39,6 +39,7 @@ SCAN_PROMPT = """你是代码审查专家。请审查以下模块的代码，找
   1. **bug 触发点**：错误行为发生的具体行（如 "catch 块 (line 274) 未调用 deactivate()"）
   2. **正常路径对比**：正常路径在哪里做了正确处理（如 "正常路径在 stopRecording (line 343) 调用了 deactivate()"）
   3. **影响范围**：错误状态被谁消费（如 "后续 startRecording (line 196) 的 guard 检查 isRecording 会被此残留值拦截"）
+- 缺失类 bug（missing timeout/missing guard/missing cleanup）同样要锚定行号——指向"应该加东西的位置"（如 "ws.send() (line 142) 此处缺少 timeout 机制"）
 - 模糊描述（如 "某个方法没有清理资源"）不可接受——必须精确到行号
 
 请精读上述所有文件（变更文件和边界对端文件同等重要），再根据调用链和引用关系扩展到必要的上下文文件。"""
@@ -89,6 +90,7 @@ DEEP_R2_PROMPT = """你是代码审查专家，正在进行第二轮深度扫描
 ### 行号精度要求（严格执行）
 - `file` 和 `line` 字段指向 bug 核心位置
 - `description` 中用 `函数名 (line N)` 格式引用关键行号：bug 触发点、正常路径对比点、影响范围
+- 缺失类 bug（missing timeout/guard/cleanup）锚定"应该加东西的位置"
 - 模糊描述不可接受——必须精确到行号"""
 
 BOOTSTRAP_SCAN_PROMPT = """请扫描当前项目结构，生成 test-governance/config.yaml。
