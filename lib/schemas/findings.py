@@ -24,7 +24,12 @@ FINDINGS_SCHEMA = {
                         "enum": ["behavior", "missing_mechanism", "compile"]
                     },
                     "why_not_caught": {"type": "string"},
-                    "infra_needed": {"type": "string"}
+                    "infra_needed": {"type": "string"},
+                    "modules": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "涉及的模块列表（跨模块 finding 使用，如 ['togo-agent', 'iOS-app']）"
+                    }
                 },
                 "required": ["id", "category", "file", "line", "description", "severity"]
             }

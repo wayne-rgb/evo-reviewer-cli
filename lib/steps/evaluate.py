@@ -121,6 +121,9 @@ def run_evaluate(state, project_root, confirmed_ids, modules_by_name):
                 "trigger_probability": ev.get("trigger_probability", ""),
             }
 
+    # 保存完整评估详情到 state（供 _print_evaluate_summary 展示）
+    state.evaluate_details = {fid: ev for fid, ev in results.items() if fid in valid_finding_ids}
+
     # 打印摘要
     must_fix = sum(1 for ev in results.values() if ev.get("verdict") == "must_fix")
     verify = sum(1 for ev in results.values() if ev.get("verdict") == "verify")

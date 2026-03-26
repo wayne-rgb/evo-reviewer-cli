@@ -168,93 +168,90 @@ def _build_scan_prompt(module, state, changed_by_module, boundary_context, p0_co
 
 
 def run_deep_r2(state, project_root, modules, r1_findings):
-    """R2 深度扫描（/deep 专用）"""
+    """R2 跨模块业务流扫描（/deep 专用）——单 session，全模块视野。
+
+    从用户场景出发追踪数据跨模块流转，在模块交界处找不一致。
+    单个 Claude session，cwd 为项目根目录，可 Read 所有模块文件。
+    """
     from lib.claude import call_claude_bare
-    from lib.prompts.scan import DEEP_R2_PROMPT, BOUNDARY_SECTION_TEMPLATE
+    from lib.prompts.scan import DEEP_R2_CROSS_MODULE_PROMPT
     from lib.schemas.findings import FINDINGS_SCHEMA
     from lib.filters import filter_findings
+    from lib.steps.scope import extract_all_boundaries
 
-    changed_by_module = getattr(state, "changed_by_module", {})
-    boundary_context = getattr(state, "boundary_context", {})
+    # 1. 提取全量边界（不依赖 git diff）
+    boundaries = extract_all_boundaries(project_root)
 
-    r2_findings = []
+    # 2. 构建模块信息
+    modules_info = "\n".join(
+        f"- **{m.name}**（{m.language}）: `{m.src_dir}`"
+        for m in modules
+    )
+
+    # 3. 构建边界文件对文本
+    boundary_pairs = _format_boundary_pairs(boundaries)
+
+    # 4. R1 摘要
     r1_summary = _summarize_findings(r1_findings)
 
-    with ThreadPoolExecutor(max_workers=max(1, len(modules))) as pool:
-        futures = {}
-        for m in modules:
-            # 变更文件列表
-            module_files = changed_by_module.get(m.name, [])
-            if module_files:
-                changed_files_section = "\n".join(f"- {f}" for f in module_files)
-            else:
-                changed_files_section = f"请扫描 {m.src_dir} 目录。"
+    # 5. 计算 timeout（所有模块之和 × 1.5，上限 30 分钟）
+    total_timeout = sum(m.estimate_timeout(project_root, task="scan") for m in modules)
+    timeout = min(int(total_timeout * 1.5), 1800)
 
-            # 边界段落（R2 同样需要）
-            boundary_info = boundary_context.get(m.name)
-            if boundary_info:
-                boundary_files = boundary_info.get("boundary_files", [])
-                counterpart_files = boundary_info.get("counterpart_files", {})
-                protocols = boundary_info.get("protocols", [])
-                pairs_lines = []
-                for bf in boundary_files:
-                    cps = counterpart_files.get(bf, [])
-                    pairs_lines.append(f"本端变更文件：`{bf}`")
-                    for cp in cps:
-                        pairs_lines.append(f"  → 对端文件：`{cp}`")
-                boundary_section = BOUNDARY_SECTION_TEMPLATE.format(
-                    protocols=", ".join(protocols) if protocols else "未知",
-                    boundary_file_pairs="\n".join(pairs_lines),
-                )
-            else:
-                boundary_section = ""
+    # 6. 单 session 调用
+    prompt = DEEP_R2_CROSS_MODULE_PROMPT.format(
+        topology_summary=boundaries.get("topology_summary", "未检测到模块间通信拓扑"),
+        modules_info=modules_info,
+        boundary_pairs=boundary_pairs if boundary_pairs else "未检测到边界文件对，请基于代码自行追踪模块间调用。",
+        r1_summary=r1_summary,
+    )
 
-            prompt = DEEP_R2_PROMPT.format(
-                module_name=m.name,
-                language=m.language,
-                r1_summary=r1_summary,
-                changed_files_section=changed_files_section,
-                boundary_section=boundary_section,
-            )
-            timeout = m.estimate_timeout(project_root, task="scan")
-            future = pool.submit(
-                call_claude_bare,
-                prompt=prompt,
-                model="opus",
-                tools="Read,Glob,Grep",
-                output_schema=FINDINGS_SCHEMA,
-                max_turns=30,
-                cwd=project_root,
-                timeout=timeout,
-            )
-            futures[future] = m
+    try:
+        result = call_claude_bare(
+            prompt=prompt,
+            model="opus",
+            tools="Read,Glob,Grep",
+            output_schema=FINDINGS_SCHEMA,
+            max_turns=60,
+            cwd=project_root,
+            timeout=timeout,
+        )
+    except Exception as e:
+        logger.error(f"R2 跨模块扫描失败: {e}")
+        state.r2_findings = []
+        return []
 
-        for future in as_completed(futures):
-            m = futures[future]
-            try:
-                result = future.result()
-                findings = _extract_findings(result, m.name)
-                findings, filtered_out = filter_findings(findings, m.language)
-                if filtered_out:
-                    state.filtered_findings.extend(filtered_out)
+    # 7. 提取 findings — 根据 file 路径推断模块归属
+    r2_findings = _extract_cross_module_findings(result, modules)
 
-                if len(findings) == 0:
-                    logger.info(f"{m.name}: R2 无新发现，提前终止")
-                else:
-                    logger.info(f"{m.name}: R2 发现 {len(findings)} 个问题")
+    # 8. 过滤（跨模块 finding 跳过语言级过滤，避免误判）
+    kept_findings = []
+    for f in r2_findings:
+        f_modules = f.get("modules", [])
+        if len(f_modules) > 1:
+            # 跨模块 finding：涉及多种语言，跳过语言级过滤
+            kept_findings.append(f)
+        else:
+            lang = _infer_language(f.get("file", ""), modules)
+            kept, filtered_out = filter_findings([f], lang)
+            kept_findings.extend(kept)
+            if filtered_out:
+                state.filtered_findings.extend(filtered_out)
+    r2_findings = kept_findings
 
-                r2_findings.extend(findings)
-            except Exception as e:
-                logger.error(f"{m.name} R2 扫描失败: {e}")
-
-    # R1/R2 模糊去重：同文件 + 行号差 ≤5 + 描述相似 → 视为重复
+    # 9. 去重
     before_dedup = len(r2_findings)
     r2_findings = _dedup_findings(r1_findings, r2_findings)
     dedup_count = before_dedup - len(r2_findings)
     if dedup_count > 0:
         logger.info("R2 去重：移除了 %d 个与 R1 重复的 finding", dedup_count)
 
-    # 全局 ID，续接 R1
+    if r2_findings:
+        logger.info(f"R2 跨模块扫描发现 {len(r2_findings)} 个问题")
+    else:
+        logger.info("R2 跨模块扫描无新发现")
+
+    # 10. 全局 ID，续接 R1
     start = len(state.findings) + 1
     for i, f in enumerate(r2_findings, start):
         f["id"] = f"F{i}"
@@ -262,6 +259,86 @@ def run_deep_r2(state, project_root, modules, r1_findings):
     state.r2_findings = r2_findings
     state.findings.extend(r2_findings)
     return r2_findings
+
+
+def _extract_cross_module_findings(result, modules):
+    """从跨模块扫描的 Claude 返回中提取 findings。
+
+    如果 Claude 填了 modules 数组，取第一个作为 module（向后兼容）。
+    如果没填 module，根据 file 路径推断所属模块。
+    """
+    if isinstance(result, dict):
+        findings = result.get("findings", [])
+    elif isinstance(result, str):
+        try:
+            data = json.loads(result)
+            findings = data.get("findings", [])
+        except json.JSONDecodeError:
+            logger.warning(f"无法解析 R2 扫描结果: {result[:200]}")
+            findings = []
+    else:
+        findings = []
+
+    modules_by_prefix = {}
+    for m in modules:
+        # src_dir 如 "togo-agent/src/" → 前缀 "togo-agent/"
+        prefix = m.src_dir.rstrip("/").split("/")[0] + "/"
+        modules_by_prefix[prefix] = m.name
+
+    for f in findings:
+        # 如果有 modules 数组，取第一个作为 module
+        if f.get("modules") and not f.get("module"):
+            f["module"] = f["modules"][0]
+
+        # 如果没有 module，从 file 路径推断
+        if not f.get("module"):
+            file_path = f.get("file", "")
+            for prefix, mod_name in modules_by_prefix.items():
+                if file_path.startswith(prefix):
+                    f["module"] = mod_name
+                    break
+            else:
+                f["module"] = "unknown"
+
+    return findings
+
+
+def _format_boundary_pairs(boundaries):
+    """格式化边界文件对为可读文本"""
+    module_pairs = boundaries.get("module_pairs", [])
+    if not module_pairs:
+        return ""
+
+    lines = []
+    for mp in module_pairs:
+        mods = " ↔ ".join(mp["modules"])
+        protos = ", ".join(mp["protocols"]) if mp["protocols"] else "未知"
+        lines.append(f"### {mods}（{protos}）")
+
+        shared_files = mp.get("shared_files", {})
+        for src_file, dst_files in shared_files.items():
+            lines.append(f"- `{src_file}`")
+            for df in dst_files:
+                lines.append(f"  ↔ `{df}`")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def _infer_language(file_path, modules):
+    """根据文件路径推断语言"""
+    for m in modules:
+        prefix = m.src_dir.rstrip("/").split("/")[0] + "/"
+        if file_path.startswith(prefix):
+            return m.language
+    # fallback by extension
+    if file_path.endswith(".ts") or file_path.endswith(".js"):
+        return "typescript"
+    if file_path.endswith(".swift"):
+        return "swift"
+    if file_path.endswith(".go"):
+        return "go"
+    return "unknown"
 
 
 def _dedup_findings(existing, new_findings):

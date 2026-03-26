@@ -86,6 +86,78 @@ def _print_verify_summary(state):
     print(f"{'='*60}")
 
 
+def _print_evaluate_summary(state):
+    """R3 深度评估完成后的摘要，展示每个 finding 的评估结果。
+
+    从 evaluate.py 的 run_evaluate 返回后，state.results 中包含 eval_skipped 的 findings，
+    而 evaluate 内部的 results dict 包含所有评估详情。我们需要从 state 的 evaluate_details
+    或 findings-all.json 获取完整评估信息。
+
+    当前实现：eval_skipped 的有详情（存入 state.results），must_fix/verify 的只有 verdict。
+    为展示 must_fix/verify 的详情，从 evaluate_details 属性读取（如果有）。
+    """
+    # 收集所有评估结果
+    eval_skipped_ids = set()
+    eval_details = {}
+    for fid, result in state.results.items():
+        r = result if isinstance(result, dict) else {"status": getattr(result, "status", "")}
+        if r.get("status") == "eval_skipped":
+            eval_skipped_ids.add(fid)
+            eval_details[fid] = r
+
+    # evaluate_details 属性存储了完整的 R3 评估结果（包括 must_fix/verify）
+    full_details = getattr(state, "evaluate_details", {})
+    for fid, detail in full_details.items():
+        if fid not in eval_details:
+            eval_details[fid] = detail
+
+    # 分类统计
+    all_ids = {f["id"] for f in state.findings}
+    to_verify_ids = all_ids - eval_skipped_ids
+    must_fix_ids = {fid for fid, d in full_details.items() if d.get("verdict") == "must_fix"}
+    verify_ids = to_verify_ids - must_fix_ids
+
+    print(f"\n{'='*60}")
+    print(f"[STAGE_COMPLETE] evaluate")
+    print(f"R3 深度评估完成：{len(must_fix_ids)} must_fix / {len(verify_ids)} verify / {len(eval_skipped_ids)} skip")
+    print(f"{'='*60}")
+
+    # 按判定分组展示
+    def _print_finding(f, verdict, detail):
+        fid = f["id"]
+        severity = f.get("severity", "?")
+        file_loc = f"{f.get('file', '?')}:{f.get('line', '?')}"
+        actual_sev = detail.get("actual_severity", severity) if detail else severity
+        trigger = detail.get("trigger_probability", "?") if detail else "?"
+        reason = detail.get("reason", "") if detail else ""
+
+        print(f"  [{fid}] **{verdict}** ({severity}→{actual_sev}, 触发={trigger})")
+        print(f"    {file_loc}")
+        if reason:
+            print(f"    理由：{reason}")
+        print()
+
+    if must_fix_ids:
+        print("\n### must_fix（必须修复，直接进入 R4）\n")
+        for f in state.findings:
+            if f["id"] in must_fix_ids:
+                _print_finding(f, "must_fix", eval_details.get(f["id"]))
+
+    if verify_ids:
+        print("\n### verify（需红绿验证确认）\n")
+        for f in state.findings:
+            if f["id"] in verify_ids:
+                _print_finding(f, "verify", eval_details.get(f["id"]))
+
+    if eval_skipped_ids:
+        print("\n### skip（不进入 R4，已跳过）\n")
+        for f in state.findings:
+            if f["id"] in eval_skipped_ids:
+                _print_finding(f, "skip", eval_details.get(f["id"]))
+
+    print(f"共 {len(to_verify_ids)} 个 finding 将进入 R4 红绿验证（{len(eval_skipped_ids)} 个已跳过）。")
+
+
 def _run_finalize(state, project_root):
     """merge + infra + report + self-check（review 和 deep 共用的收尾流程）。
 
@@ -246,6 +318,7 @@ def cmd_review(args):
     print("\n=== 阶段 A：红绿验证 ===\n")
     modules_by_name = {m.name: m for m in modules}
     run_verify(state, project_root, confirmed_ids, modules_by_name)
+    state.advance("verify")
     state.save(state.state_file(project_root))
     _print_verify_summary(state)
 
@@ -396,6 +469,7 @@ def cmd_deep(args):
         return 0
 
     if _should_stop(until, "evaluate"):
+        _print_evaluate_summary(state)
         elapsed = (time.time() - start_time) / 60
         print(f"\n耗时：{elapsed:.1f} 分钟（--until evaluate 停止）")
         return 0
@@ -504,30 +578,102 @@ def cmd_resume(args):
                 # 没有 --confirmed，用全部 findings
                 confirmed_ids = [f["id"] for f in state.findings]
 
-        # 过滤掉已有验证结果的 bug（verify 中途崩溃后 resume 时避免重复验证）
-        already_done = {
-            fid for fid in confirmed_ids
-            if fid in state.results
-            and state.get_result_status(fid) not in ("fix_failed", "")
-        }
-        if already_done:
-            print(f"跳过已验证的 {len(already_done)} 个 bug：{', '.join(sorted(already_done))}")
-            confirmed_ids = [fid for fid in confirmed_ids if fid not in already_done]
+        # deep 命令：先执行 R3 深度评估，过滤低价值 findings
+        if state.command == "deep":
+            print("\n=== R3：深度评估（opus） ===\n")
+            from lib.steps.evaluate import run_evaluate
+            confirmed_ids = run_evaluate(state, project_root, confirmed_ids, modules_by_name)
+            state.advance("evaluate")
+            state.save(state.state_file(project_root))
 
-        if not confirmed_ids:
-            print("无 bug 需要验证。")
+            if not confirmed_ids:
+                print("深度评估认为所有发现均不值得红绿验证，跳到收尾。")
+                state.advance("verify")
+                state.save(state.state_file(project_root))
+                _run_finalize(state, project_root)
+                elapsed = (time.time() - start_time) / 60
+                print(f"\n总耗时：{elapsed:.1f} 分钟")
+                return 0
+
+            if _should_stop(until, "evaluate"):
+                _print_evaluate_summary(state)
+                elapsed = (time.time() - start_time) / 60
+                print(f"\n耗时：{elapsed:.1f} 分钟（--until evaluate 停止）")
+                return 0
+
+            phase = "evaluate"  # fall through 到 evaluate 分支
+
+        else:
+            # review 命令：直接进入红绿验证
+            # 过滤掉已有验证结果的 bug（verify 中途崩溃后 resume 时避免重复验证）
+            already_done = {
+                fid for fid in confirmed_ids
+                if fid in state.results
+                and state.get_result_status(fid) not in ("fix_failed", "")
+            }
+            if already_done:
+                print(f"跳过已验证的 {len(already_done)} 个 bug：{', '.join(sorted(already_done))}")
+                confirmed_ids = [fid for fid in confirmed_ids if fid not in already_done]
+
+            if not confirmed_ids:
+                print("无 bug 需要验证。")
+                return 0
+
+            print(f"\n=== 红绿验证（{len(confirmed_ids)} 个 bug） ===\n")
+            from lib.steps.verify import run_verify
+            run_verify(state, project_root, confirmed_ids, modules_by_name)
+            state.advance("verify")
+            state.save(state.state_file(project_root))
+
+            _print_verify_summary(state)
+
+            if _should_stop(until, "verify"):
+                elapsed = (time.time() - start_time) / 60
+                print(f"\n耗时：{elapsed:.1f} 分钟（--until verify 停止）")
+                return 0
+
+            phase = "verify"  # fall through
+
+    # --- evaluate 阶段：deep 模式的 R3 深度评估后 resume ---
+    if phase == "evaluate":
+        if _should_stop(until, "evaluate"):
+            _print_evaluate_summary(state)
             return 0
 
-        print(f"\n=== 红绿验证（{len(confirmed_ids)} 个 bug） ===\n")
-        from lib.steps.verify import run_verify
-        run_verify(state, project_root, confirmed_ids, modules_by_name)
+        # --confirmed 覆盖 R3 判定：用户可以把 R3 skip 的 finding 加回来
+        override_ids = _parse_confirmed(confirmed_arg, state)
+        if override_ids is not None:
+            # 用户显式指定了要验证的 ID，撤销这些 ID 的 eval_skipped 状态
+            for fid in override_ids:
+                if fid in state.results and state.get_result_status(fid) == "eval_skipped":
+                    del state.results[fid]
+                    logger.info(f"用户覆盖 R3 判定：{fid} 从 eval_skipped 恢复为待验证")
+            remaining = override_ids
+        else:
+            # 默认：排除所有已有结果的 findings（eval_skipped + 已验证的）
+            remaining = [
+                f["id"] for f in state.findings
+                if f["id"] not in state.results
+            ]
+        skipped_count = sum(
+            1 for r in state.results.values()
+            if (r.get("status") if isinstance(r, dict) else getattr(r, "status", "")) == "eval_skipped"
+        )
+        if remaining:
+            print(f"\n=== R4：红绿验证（{len(remaining)} 个 bug，{skipped_count} 个已被 R3 跳过） ===\n")
+            from lib.steps.verify import run_verify
+            run_verify(state, project_root, remaining, modules_by_name)
+        else:
+            print("所有 findings 已被 R3 评估跳过，无需红绿验证。")
+
+        state.advance("verify")
         state.save(state.state_file(project_root))
 
-        # deep 模式还有 R5 交叉检验
         if state.command == "deep":
             print("\n=== R5：交叉检验（轻量） ===\n")
             from lib.steps.cross_validate import run_cross_validate
             run_cross_validate(state, project_root, modules_by_name)
+            state.advance("cross_validate")
             state.save(state.state_file(project_root))
 
         _print_verify_summary(state)
@@ -537,35 +683,6 @@ def cmd_resume(args):
             print(f"\n耗时：{elapsed:.1f} 分钟（--until verify 停止）")
             return 0
 
-        phase = "verify"  # fall through
-
-    # --- evaluate 阶段：deep 模式的 R3 深度评估后 resume ---
-    if phase == "evaluate":
-        # R3 已完成（advance 到 evaluate 后崩溃），直接进入 verify
-        # 排除所有已有结果的 findings（eval_skipped + 已验证的）
-        remaining = [
-            f["id"] for f in state.findings
-            if f["id"] not in state.results
-        ]
-        skipped_count = sum(
-            1 for r in state.results.values()
-            if (r.get("status") if isinstance(r, dict) else getattr(r, "status", "")) == "eval_skipped"
-        )
-        if remaining:
-            print(f"\n=== R4：红绿验证（{len(remaining)} 个 bug，{skipped_count} 个已被 R3 跳过） ===\n")
-            from lib.steps.verify import run_verify
-            run_verify(state, project_root, remaining, modules_by_name)
-            state.save(state.state_file(project_root))
-        else:
-            print("所有 findings 已被 R3 评估跳过，无需红绿验证。")
-
-        if state.command == "deep":
-            print("\n=== R5：交叉检验（轻量） ===\n")
-            from lib.steps.cross_validate import run_cross_validate
-            run_cross_validate(state, project_root, modules_by_name)
-            state.save(state.state_file(project_root))
-
-        _print_verify_summary(state)
         phase = "verify"  # fall through
 
     # --- verify 阶段：可能有未完成的验证，然后收尾 ---

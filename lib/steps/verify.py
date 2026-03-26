@@ -105,7 +105,7 @@ def _verify_module(state, project_root, mod_name, bugs, wt, module):
         for file_path, file_bugs in by_file.items():
             # 同文件的 bug 串行处理
             future = pool.submit(
-                _verify_file_bugs, file_bugs, wt, module, project_root
+                _verify_file_bugs, file_bugs, wt, module, project_root, state=state
             )
             futures[future] = file_path
 
@@ -134,17 +134,124 @@ def _verify_module(state, project_root, mod_name, bugs, wt, module):
         commit_in_worktree(wt, f"evo-review: {mod_name} 红绿验证修复")
 
 
-def _verify_file_bugs(bugs, wt, module, project_root):
+def _verify_file_bugs(bugs, wt, module, project_root, state=None):
     """串行验证同一文件的多个 bug"""
     results = {}
     for bug in bugs:
-        result = _verify_single_bug(bug, wt, module, project_root)
+        result = _verify_single_bug(bug, wt, module, project_root, state=state)
         results[bug["id"]] = result
     return results
 
 
-def _verify_single_bug(bug, wt, module, project_root):
-    """单个 bug 的红绿验证。独立 claude 调用。
+def _verify_single_bug(bug, wt, module, project_root, state=None):
+    """单个 bug 的验证。根据 R3 verdict 分流：
+
+    must_fix（R3 已确认真实）：跳过红测试，直接修复 + 绿测试验证
+    其他（verify / 无 R3）：标准红绿验证流程
+    """
+    bug_id = bug["id"]
+
+    # 检查 R3 verdict：must_fix 走快速路径
+    eval_verdict = None
+    if state and hasattr(state, "evaluate_details"):
+        eval_detail = state.evaluate_details.get(bug_id, {})
+        eval_verdict = eval_detail.get("verdict")
+
+    if eval_verdict == "must_fix":
+        return _verify_must_fix(bug, wt, module, project_root, state)
+
+    return _verify_red_green(bug, wt, module, project_root)
+
+
+def _verify_must_fix(bug, wt, module, project_root, state=None):
+    """must_fix 快速路径：R3 已确认真实，跳过红测试，直接修复 + 绿测试。
+
+    流程：
+    1. 直接修复 + 写绿测试（一次 claude session）
+    2. CLI 跑测试
+    3. 通过 -> verified
+    4. 失败 -> 重试一次
+    5. 仍失败 -> fix_failed，回滚
+    """
+    from lib.claude import call_claude_session
+    from lib.prompts.verify import MUST_FIX_PROMPT, RETRY_FIX_PROMPT
+
+    bug_id = bug["id"]
+    verify_timeout = module.estimate_timeout(project_root, task="verify")
+    logger.info(f"[{bug_id}] must_fix 快速验证: {bug.get('file')}:{bug.get('line')}")
+
+    pre_snap = _snapshot_dirty_files(wt.path)
+
+    # R3 评估理由
+    eval_reason = ""
+    if state and hasattr(state, "evaluate_details"):
+        eval_reason = state.evaluate_details.get(bug_id, {}).get("reason", "")
+
+    # 1. 直接修复 + 写绿测试
+    cross_module_hint = _build_cross_module_hint(bug)
+    prompt = MUST_FIX_PROMPT.format(
+        bug_id=bug_id,
+        bug_file=bug.get("file", ""),
+        bug_line=bug.get("line", 0),
+        bug_description=bug.get("description", ""),
+        eval_reason=eval_reason,
+        cross_module_hint=cross_module_hint,
+    )
+
+    try:
+        call_claude_session(
+            prompt=prompt,
+            model="opus",
+            tools="Read,Glob,Grep,Edit,Write",
+            max_turns=15,
+            cwd=wt.path,
+            timeout=verify_timeout,
+        )
+    except Exception as e:
+        logger.error(f"[{bug_id}] must_fix 修复失败: {e}")
+        _revert_changes(wt.path, bug, pre_snapshot=pre_snap)
+        return {"status": "fix_failed", "reason": f"must_fix 修复失败: {e}"}
+
+    # 2. 跑测试
+    test_result = _run_test(wt.path, bug, module)
+    if test_result["exit_code"] == 0:
+        logger.info(f"[{bug_id}] must_fix 验证通过")
+        return {"status": "verified", "test_file": _guess_test_file(bug, module, wt.path)}
+
+    # 3. 重试一次
+    logger.info(f"[{bug_id}] must_fix 测试失败，重试")
+    retry_prompt = RETRY_FIX_PROMPT.format(
+        bug_id=bug_id,
+        bug_file=bug.get("file", ""),
+        bug_line=bug.get("line", 0),
+        error_output=_tail(test_result["output"], 30),
+    )
+
+    try:
+        call_claude_session(
+            prompt=retry_prompt,
+            model="opus",
+            tools="Read,Glob,Grep,Edit,Write",
+            max_turns=15,
+            cwd=wt.path,
+            timeout=verify_timeout,
+        )
+    except Exception as e:
+        _revert_changes(wt.path, bug, pre_snapshot=pre_snap)
+        return {"status": "fix_failed", "reason": f"must_fix 重试失败: {e}"}
+
+    retry_result = _run_test(wt.path, bug, module)
+    if retry_result["exit_code"] == 0:
+        logger.info(f"[{bug_id}] must_fix 重试后验证通过")
+        return {"status": "verified", "test_file": _guess_test_file(bug, module, wt.path)}
+
+    _revert_changes(wt.path, bug, pre_snapshot=pre_snap)
+    logger.info(f"[{bug_id}] must_fix 修复失败")
+    return {"status": "fix_failed", "reason": "must_fix 重试后测试仍失败"}
+
+
+def _verify_red_green(bug, wt, module, project_root):
+    """标准红绿验证流程。
 
     流程：
     1. 写测试（模式 B，无 Bash）
@@ -235,11 +342,13 @@ def _verify_single_bug(bug, wt, module, project_root):
 
     # 5. 红灯确认，写修复
     logger.info(f"[{bug_id}] 红灯确认，开始写修复")
+    cross_module_hint = _build_cross_module_hint(bug)
     fix_prompt = WRITE_FIX_PROMPT.format(
         bug_id=bug_id,
         bug_file=bug.get("file", ""),
         bug_line=bug.get("line", 0),
         bug_description=bug.get("description", ""),
+        cross_module_hint=cross_module_hint,
     )
 
     try:
@@ -293,6 +402,14 @@ def _verify_single_bug(bug, wt, module, project_root):
     _revert_changes(wt.path, bug, pre_snapshot=pre_snap)
     logger.info(f"[{bug_id}] 修复失败")
     return {"status": "fix_failed", "reason": "重试后测试仍失败"}
+
+
+def _build_cross_module_hint(bug):
+    """构建跨模块提示。如果 bug 涉及多个模块，提醒 Claude 同时修复所有模块。"""
+    modules = bug.get("modules", [])
+    if len(modules) > 1:
+        return f"- **跨模块 bug**：涉及 {', '.join(modules)}，必须检查并修复所有涉及模块的对应文件"
+    return ""
 
 
 def _run_test(wt_path, bug, module):

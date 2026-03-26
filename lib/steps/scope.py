@@ -392,6 +392,82 @@ def _expand_boundaries(changed_by_module, topology, all_modules, project_root):
     return boundary_context
 
 
+# ==================== 全量边界提取（/deep 专用） ====================
+
+def extract_all_boundaries(project_root):
+    """提取所有模块间的边界文件对（不依赖 git diff）。
+
+    用于 /deep 全模块扫描时的 R2 跨模块业务流扫描。
+    直接从 topology 提取所有模块对的边界信息。
+
+    返回：
+    {
+        "module_pairs": [
+            {
+                "modules": ["togo-agent", "iOS-app"],
+                "protocols": ["WebSocket"],
+                "shared_files": {
+                    "togo-agent/src/types/index.ts": ["iOS-app/.../Message.swift"],
+                },
+            },
+            ...
+        ],
+        "topology_summary": "togo-agent 是中心节点，...",
+    }
+    """
+    topology = _parse_topology(project_root)
+
+    module_pairs = []
+    seen_pairs = set()  # 避免 A→B 和 B→A 重复
+
+    for src_mod, peers in topology.items():
+        for dst_mod, peer_info in peers.items():
+            pair_key = tuple(sorted([src_mod, dst_mod]))
+            if pair_key in seen_pairs:
+                continue
+            seen_pairs.add(pair_key)
+
+            shared_types = peer_info.get("shared_types", [])
+            counterparts = peer_info.get("counterparts", {})
+            protocols = peer_info.get("protocols", [])
+
+            # 合并双向的 shared_files
+            shared_files = {}
+            for st in shared_types:
+                cps = counterparts.get(st, [])
+                if cps:
+                    shared_files[st] = cps
+            # 也检查反向
+            reverse_info = topology.get(dst_mod, {}).get(src_mod, {})
+            for st in reverse_info.get("shared_types", []):
+                cps = reverse_info.get("counterparts", {}).get(st, [])
+                if cps and st not in shared_files:
+                    shared_files[st] = cps
+
+            if shared_files or protocols:
+                module_pairs.append({
+                    "modules": list(pair_key),
+                    "protocols": protocols,
+                    "shared_files": shared_files,
+                })
+
+    # 生成拓扑摘要
+    if module_pairs:
+        summary_parts = []
+        for mp in module_pairs:
+            mods = " ↔ ".join(mp["modules"])
+            protos = ", ".join(mp["protocols"]) if mp["protocols"] else "未知协议"
+            summary_parts.append(f"{mods}（{protos}）")
+        topology_summary = "模块间通信：" + "；".join(summary_parts)
+    else:
+        topology_summary = "未检测到模块间通信拓扑"
+
+    return {
+        "module_pairs": module_pairs,
+        "topology_summary": topology_summary,
+    }
+
+
 # ==================== P0 场景关联 ====================
 
 def _load_related_p0_cases(changed_files, project_root):

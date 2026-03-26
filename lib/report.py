@@ -129,7 +129,7 @@ def generate_verify_report(results: dict, findings: list) -> str:
         test_file = _get_result_field(result, "test_file", "")
 
         mark = _status_to_mark(status)
-        module = f.get("module", "?")
+        module = _format_module(f)
         desc = f.get("description", fid)
         fix_info = test_file if test_file else reason
 
@@ -275,7 +275,7 @@ def generate_final_report(state) -> str:
         test_file = _get_result_field(result, "test_file", "")
 
         mark = _status_to_mark(status)
-        module = f.get("module", "?")
+        module = _format_module(f)
         desc = f.get("description", fid)
         fix_info = test_file if test_file else reason
 
@@ -422,6 +422,14 @@ def _get_result_field(result, field_name: str, default=None):
     if isinstance(result, dict):
         return result.get(field_name, default)
     return getattr(result, field_name, default)
+
+
+def _format_module(finding: dict) -> str:
+    """格式化 finding 的模块显示。跨模块 finding 展示为 'A + B'。"""
+    modules = finding.get("modules")
+    if modules and len(modules) > 1:
+        return " + ".join(modules)
+    return finding.get("module", "?")
 
 
 def _get_state_field(state, field_name: str, default=None):

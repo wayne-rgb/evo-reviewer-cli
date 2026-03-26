@@ -97,6 +97,8 @@ class ReviewState:
     # 深度 review 专用
     r2_findings: list = field(default_factory=list)
     r5_findings: list = field(default_factory=list)
+    # R3 深度评估详情 {finding_id: {verdict, trigger_probability, trigger_scenario, ...}}
+    evaluate_details: dict = field(default_factory=dict)
 
     def save(self, path: str) -> None:
         """序列化为 JSON 写入文件。自动创建父目录。"""
