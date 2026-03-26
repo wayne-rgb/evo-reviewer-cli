@@ -23,7 +23,7 @@ logging.basicConfig(
 logger = logging.getLogger("evo-review")
 
 # --until 可用的阶段名（review 和 deep 共享）
-VALID_STAGES = ("scan", "confirm", "verify", "done")
+VALID_STAGES = ("scan", "confirm", "evaluate", "verify", "done")
 
 
 def _detect_project_root():
@@ -65,17 +65,24 @@ def _print_scan_summary(state, include_confirm_report=False):
 
 def _print_verify_summary(state):
     """验证完成后的摘要。"""
-    verified = sum(1 for r in state.results.values()
-                   if (r.get("status") if isinstance(r, dict) else getattr(r, "status", "")) == "verified")
-    hallucination = sum(1 for r in state.results.values()
-                        if (r.get("status") if isinstance(r, dict) else getattr(r, "status", "")) == "hallucination")
-    fix_failed = sum(1 for r in state.results.values()
-                     if (r.get("status") if isinstance(r, dict) else getattr(r, "status", "")) == "fix_failed")
-    other = len(state.results) - verified - hallucination - fix_failed
+    def _count_status(status_name):
+        return sum(1 for r in state.results.values()
+                   if (r.get("status") if isinstance(r, dict) else getattr(r, "status", "")) == status_name)
+
+    verified = _count_status("verified")
+    hallucination = _count_status("hallucination")
+    fix_failed = _count_status("fix_failed")
+    eval_skipped = _count_status("eval_skipped")
+    other = len(state.results) - verified - hallucination - fix_failed - eval_skipped
 
     print(f"\n{'='*60}")
     print(f"[STAGE_COMPLETE] verify")
-    print(f"验证完成：{verified} verified / {hallucination} hallucination / {fix_failed} fix_failed / {other} other")
+    parts = [f"{verified} verified", f"{hallucination} hallucination", f"{fix_failed} fix_failed"]
+    if eval_skipped:
+        parts.append(f"{eval_skipped} eval_skipped")
+    if other:
+        parts.append(f"{other} other")
+    print(f"验证完成：{' / '.join(parts)}")
     print(f"{'='*60}")
 
 
@@ -376,11 +383,13 @@ def cmd_deep(args):
     modules_by_name = {m.name: m for m in modules}
     from lib.steps.evaluate import run_evaluate
     ids_to_verify = run_evaluate(state, project_root, confirmed_ids, modules_by_name)
+    state.advance("evaluate")
     state.save(state.state_file(project_root))
 
     if not ids_to_verify:
         print("深度评估认为所有发现均不值得红绿验证，跳到收尾。")
         state.advance("verify")
+        state.save(state.state_file(project_root))
         _run_finalize(state, project_root)
         elapsed = (time.time() - start_time) / 60
         print(f"\n总耗时：{elapsed:.1f} 分钟")

@@ -380,6 +380,7 @@ def generate_stats(state) -> dict:
         "fix_failed": 0,
         "unverified": 0,
         "skipped": 0,
+        "eval_skipped": 0,
     }
 
     for fid, result in results.items():
@@ -409,6 +410,7 @@ def _status_to_mark(status: str) -> str:
         "fix_failed": "!",
         "unverified": "?",
         "skipped": "-",
+        "eval_skipped": "~",  # R3 深度评估判定不值得修复
     }
     return marks.get(status, "?")
 

@@ -2,12 +2,9 @@
 
 import logging
 import json
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
-
-_results_lock = threading.Lock()
 
 
 def run_evaluate(state, project_root, confirmed_ids, modules_by_name):
@@ -95,22 +92,25 @@ def run_evaluate(state, project_root, confirmed_ids, modules_by_name):
                 for f in findings:
                     results[f["id"]] = {"id": f["id"], "verdict": "verify", "reason": f"评估失败: {e}"}
 
-    # 分类
+    # 分类（只处理 results 中有评估结果的 ID，过滤无效 ID）
+    valid_finding_ids = {f["id"] for f in state.findings}
     to_verify = []
     to_skip = []
     for fid in confirmed_ids:
+        if fid not in valid_finding_ids:
+            logger.warning(f"confirmed_ids 中的 {fid} 不在 state.findings 中，跳过")
+            continue
         ev = results.get(fid)
         if not ev or ev.get("verdict") in ("verify", "must_fix"):
             to_verify.append(fid)
         else:
             to_skip.append(fid)
-            with _results_lock:
-                state.results[fid] = {
-                    "status": "eval_skipped",
-                    "reason": ev.get("reason", "深度评估判定不值得修复"),
-                    "actual_severity": ev.get("actual_severity", ""),
-                    "trigger_probability": ev.get("trigger_probability", ""),
-                }
+            state.results[fid] = {
+                "status": "eval_skipped",
+                "reason": ev.get("reason", "深度评估判定不值得修复"),
+                "actual_severity": ev.get("actual_severity", ""),
+                "trigger_probability": ev.get("trigger_probability", ""),
+            }
 
     # 打印摘要
     must_fix = sum(1 for ev in results.values() if ev.get("verdict") == "must_fix")
