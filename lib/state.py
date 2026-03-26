@@ -20,6 +20,7 @@ class Phase(Enum):
     SCAN = "scan"
     ORGANIZE = "organize"
     CONFIRM = "confirm"
+    EVALUATE = "evaluate"
     VERIFY = "verify"
     CROSS_VALIDATE = "cross_validate"
     MERGE = "merge"
@@ -37,6 +38,7 @@ class BugStatus(Enum):
     FIX_FAILED = "fix_failed"
     UNVERIFIED = "unverified"
     SKIPPED = "skipped"
+    EVAL_SKIPPED = "eval_skipped"  # R3 深度评估判定不值得修复
 
 
 @dataclass

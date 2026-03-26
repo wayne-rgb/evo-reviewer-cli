@@ -4,8 +4,15 @@ import logging, json
 
 logger = logging.getLogger(__name__)
 
+# 单批最多 15 个 findings，防止 prompt 过大导致 opus 推理超时
+_BATCH_SIZE = 15
+
+
 def run_organize(state, project_root):
-    """调用 claude 将 findings 归类为 gaps"""
+    """调用 claude 将 findings 归类为 gaps。
+
+    超过 _BATCH_SIZE 个 findings 时自动分批，跨批同名 gap 合并。
+    """
     from lib.claude import call_claude_bare
     from lib.prompts.organize import ORGANIZE_PROMPT
     from lib.schemas.gaps import GAPS_SCHEMA
@@ -15,32 +22,76 @@ def run_organize(state, project_root):
         state.gaps = []
         return []
 
-    findings_json = json.dumps(state.findings, ensure_ascii=False, indent=2)
+    findings = state.findings
 
-    # 动态超时：基础 60s + 每个 finding 5s，下限 180s 上限 600s
-    timeout = min(600, max(180, 60 + len(state.findings) * 5))
-    logger.info("organize 超时: %ds（%d 个 findings）", timeout, len(state.findings))
+    if len(findings) <= _BATCH_SIZE:
+        # 单批直接调用
+        gaps = _call_organize(findings, call_claude_bare, ORGANIZE_PROMPT, GAPS_SCHEMA)
+    else:
+        # 分批归类
+        all_gaps = []
+        for i in range(0, len(findings), _BATCH_SIZE):
+            batch = findings[i:i + _BATCH_SIZE]
+            batch_num = i // _BATCH_SIZE + 1
+            total_batches = (len(findings) + _BATCH_SIZE - 1) // _BATCH_SIZE
+            logger.info("organize 分批 %d/%d（%d 个 findings）", batch_num, total_batches, len(batch))
+            batch_gaps = _call_organize(batch, call_claude_bare, ORGANIZE_PROMPT, GAPS_SCHEMA)
+            all_gaps.extend(batch_gaps)
+
+        # 跨批合并同名 gap
+        gaps = _merge_gaps(all_gaps)
+        logger.info("分批归类后合并：%d → %d 个盲区", len(all_gaps), len(gaps))
+
+    state.gaps = gaps
+    logger.info(f"归类为 {len(gaps)} 个盲区")
+    return gaps
+
+
+def _call_organize(findings, call_claude_bare, prompt_template, schema):
+    """对一批 findings 调用 claude 归类"""
+    findings_json = json.dumps(findings, ensure_ascii=False, indent=2)
+
+    # 动态超时：基础 120s + 每个 finding 10s，下限 300s 上限 900s
+    # 宁可多等，超时失败 = 100% token 浪费
+    timeout = min(900, max(300, 120 + len(findings) * 10))
+    logger.info("organize 超时: %ds（%d 个 findings）", timeout, len(findings))
 
     result = call_claude_bare(
-        prompt=ORGANIZE_PROMPT.format(findings_json=findings_json),
+        prompt=prompt_template.format(findings_json=findings_json),
         model="opus",
         tools="",
-        output_schema=GAPS_SCHEMA,
+        output_schema=schema,
         max_turns=5,
         timeout=timeout,
     )
 
     if isinstance(result, dict):
-        gaps = result.get("gaps", [])
+        return result.get("gaps", [])
     elif isinstance(result, str):
         try:
-            gaps = json.loads(result).get("gaps", [])
+            return json.loads(result).get("gaps", [])
         except json.JSONDecodeError:
-            logger.warning(f"无法解析归类结果")
-            gaps = []
-    else:
-        gaps = []
+            logger.warning("无法解析归类结果")
+            return []
+    return []
 
-    state.gaps = gaps
-    logger.info(f"归类为 {len(gaps)} 个盲区")
-    return gaps
+
+def _merge_gaps(gaps):
+    """合并同名 gap：相同 gap_name 的 evidence_finding_ids 合并"""
+    merged = {}
+    for g in gaps:
+        key = (g.get("module", ""), g.get("gap_name", ""))
+        if key in merged:
+            existing = merged[key]
+            existing_ids = set(existing.get("evidence_finding_ids", []))
+            new_ids = set(g.get("evidence_finding_ids", []))
+            existing["evidence_finding_ids"] = sorted(existing_ids | new_ids)
+        else:
+            merged[key] = dict(g)  # 拷贝
+
+    # 重新分配 ID
+    result = []
+    for i, g in enumerate(merged.values(), 1):
+        g["id"] = f"G{i}"
+        result.append(g)
+    return result

@@ -178,6 +178,7 @@ def cmd_review(args):
     print("\n=== 阶段 1：代码扫描（opus） ===\n")
     findings = run_scan(state, project_root, modules)
     print(f"发现 {len(findings)} 个潜在问题")
+    state.save(state.state_file(project_root))  # 扫描后立即持久化
 
     if not findings:
         print("未发现问题，审查完成。")
@@ -189,16 +190,21 @@ def cmd_review(args):
     try:
         gaps = run_organize(state, project_root)
     except Exception as e:
-        logger.error("盲区归类失败（降级为每个 finding 独立一个 gap）: %s", e)
+        logger.error("盲区归类失败，降级为按模块+类别自动分组: %s", e)
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for f in state.findings:
+            key = (f.get("module", "unknown"), f.get("category", "unknown"))
+            groups[key].append(f)
         state.gaps = [
             {
                 "id": f"G{i}",
-                "module": f.get("module", "unknown"),
-                "gap_name": f.get("description", ""),
-                "infra_plan": f.get("infra_needed", "待定"),
-                "evidence_finding_ids": [f["id"]],
+                "module": mod,
+                "gap_name": f"{mod} — {cat}（{len(findings)} 个发现）",
+                "infra_plan": "待定",
+                "evidence_finding_ids": [f["id"] for f in findings],
             }
-            for i, f in enumerate(state.findings, 1)
+            for i, ((mod, cat), findings) in enumerate(groups.items(), 1)
         ]
         gaps = state.gaps
     print(f"归类为 {len(gaps)} 个盲区")
@@ -305,11 +311,13 @@ def cmd_deep(args):
     print("\n=== R1：标准扫描（opus） ===\n")
     r1_findings = run_scan(state, project_root, modules)
     print(f"R1 发现 {len(r1_findings)} 个问题")
+    state.save(state.state_file(project_root))  # R1 后立即持久化，防后续崩溃丢数据
 
     print("\n=== R2：深度扫描（opus） ===\n")
     r2_findings = run_deep_r2(state, project_root, modules, r1_findings)
     print(f"R2 新增 {len(r2_findings)} 个问题")
     print(f"总计 {len(state.findings)} 个问题")
+    state.save(state.state_file(project_root))  # R2 后立即持久化
 
     if not state.findings:
         print("未发现问题，审查完成。")
@@ -321,17 +329,21 @@ def cmd_deep(args):
     try:
         gaps = run_organize(state, project_root)
     except Exception as e:
-        logger.error("盲区归类失败（降级为每个 finding 独立一个 gap）: %s", e)
-        # 降级：每个 finding 独立成一个 gap，不影响后续流程
+        logger.error("盲区归类失败，降级为按模块+类别自动分组: %s", e)
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for f in state.findings:
+            key = (f.get("module", "unknown"), f.get("category", "unknown"))
+            groups[key].append(f)
         state.gaps = [
             {
                 "id": f"G{i}",
-                "module": f.get("module", "unknown"),
-                "gap_name": f.get("description", ""),
-                "infra_plan": f.get("infra_needed", "待定"),
-                "evidence_finding_ids": [f["id"]],
+                "module": mod,
+                "gap_name": f"{mod} — {cat}（{len(findings)} 个发现）",
+                "infra_plan": "待定",
+                "evidence_finding_ids": [f["id"] for f in findings],
             }
-            for i, f in enumerate(state.findings, 1)
+            for i, ((mod, cat), findings) in enumerate(groups.items(), 1)
         ]
 
     state.advance("organize")
@@ -359,10 +371,29 @@ def cmd_deep(args):
         print(f"\n耗时：{elapsed:.1f} 分钟（--until confirm 停止）")
         return 0
 
+    # --- R3：深度评估 ---
+    print("\n=== R3：深度评估（opus） ===\n")
+    modules_by_name = {m.name: m for m in modules}
+    from lib.steps.evaluate import run_evaluate
+    ids_to_verify = run_evaluate(state, project_root, confirmed_ids, modules_by_name)
+    state.save(state.state_file(project_root))
+
+    if not ids_to_verify:
+        print("深度评估认为所有发现均不值得红绿验证，跳到收尾。")
+        state.advance("verify")
+        _run_finalize(state, project_root)
+        elapsed = (time.time() - start_time) / 60
+        print(f"\n总耗时：{elapsed:.1f} 分钟")
+        return 0
+
+    if _should_stop(until, "evaluate"):
+        elapsed = (time.time() - start_time) / 60
+        print(f"\n耗时：{elapsed:.1f} 分钟（--until evaluate 停止）")
+        return 0
+
     # --- R4：红绿验证 ---
     print("\n=== R4：红绿验证 ===\n")
-    modules_by_name = {m.name: m for m in modules}
-    run_verify(state, project_root, confirmed_ids, modules_by_name)
+    run_verify(state, project_root, ids_to_verify, modules_by_name)
     state.save(state.state_file(project_root))
 
     # --- R5：交叉检验 ---

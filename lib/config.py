@@ -22,8 +22,9 @@ _LANG_COMPLEXITY = {
 }
 
 # 超时下限和上限（秒）
-_TIMEOUT_MIN = 180
-_TIMEOUT_MAX = 900
+# 宁可多等几分钟，也不要超时失败——失败 = 100% token 浪费 + 重试时间
+_TIMEOUT_MIN = 480   # 8 分钟：即使小模块也需要深读协议逻辑
+_TIMEOUT_MAX = 1800  # 30 分钟：大型 Swift 项目（10MB+）的扫描上限
 
 
 @dataclass
