@@ -26,8 +26,8 @@ def call_claude_bare(
 ) -> dict:
     """
     模式 A：结构化调用（扫描/归类/判定）。
-    使用 --setting-sources "" + --disable-slash-commands + --strict-mcp-config
-    跳过 CLAUDE.md / hooks / plugins / MCP 加载，纯粹执行 prompt。
+    使用 --setting-sources "project" 只加载 CLAUDE.md（项目架构/规范知识），
+    配合 --disable-slash-commands + --strict-mcp-config 跳过 hooks / plugins / MCP。
     配合 --json-schema 强制结构化输出。
 
     参数:
@@ -44,7 +44,7 @@ def call_claude_bare(
     """
     cmd = [
         "claude",
-        "--setting-sources", "",      # 不加载任何 settings（跳过 hooks / 项目配置）
+        "--setting-sources", "project",  # 只加载 CLAUDE.md（项目知识），跳过 hooks / plugins
         "--disable-slash-commands",   # 跳过 skills / plugins
         "--strict-mcp-config",        # 不自动发现 MCP（未传 --mcp-config 则无 MCP）
         "--permission-mode", "dontAsk",  # 仅执行 --allowedTools 预批准的工具
