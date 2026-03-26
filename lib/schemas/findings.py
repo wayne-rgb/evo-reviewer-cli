@@ -15,9 +15,9 @@ FINDINGS_SCHEMA = {
                                  "concurrency", "security_boundary", "state_machine",
                                  "error_propagation", "implicit_assumption", "architecture"]
                     },
-                    "file": {"type": "string"},
-                    "line": {"type": "integer"},
-                    "description": {"type": "string"},
+                    "file": {"type": "string", "description": "bug 核心位置的文件路径"},
+                    "line": {"type": "integer", "description": "bug 核心位置的行号"},
+                    "description": {"type": "string", "description": "bug 描述，必须用 '函数名 (line N)' 格式引用关键行号：触发点、正常路径对比、影响范围"},
                     "severity": {"type": "string", "enum": ["HIGH", "MEDIUM", "LOW"]},
                     "test_strategy": {
                         "type": "string",
