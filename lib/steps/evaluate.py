@@ -59,13 +59,15 @@ def run_evaluate(state, project_root, confirmed_ids, modules_by_name):
                 cross_module_section=cross_section,
             )
             timeout = module.estimate_timeout(project_root, task="scan")
+            # 每个 finding 需要 ~2-3 次工具调用（读代码+追踪调用链），动态调整 max_turns
+            turns = max(20, len(findings) * 3)
             future = pool.submit(
                 call_claude_bare,
                 prompt=prompt,
                 model="opus",
                 tools="Read,Glob,Grep",
                 output_schema=EVALUATE_SCHEMA,
-                max_turns=20,
+                max_turns=turns,
                 cwd=project_root,
                 timeout=timeout,
             )

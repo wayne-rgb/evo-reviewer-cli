@@ -542,17 +542,17 @@ def cmd_resume(args):
     # --- evaluate 阶段：deep 模式的 R3 深度评估后 resume ---
     if phase == "evaluate":
         # R3 已完成（advance 到 evaluate 后崩溃），直接进入 verify
-        # 过滤掉 eval_skipped 的 findings
-        already_skipped = {
-            fid for fid, r in state.results.items()
-            if (r.get("status") if isinstance(r, dict) else getattr(r, "status", "")) == "eval_skipped"
-        }
+        # 排除所有已有结果的 findings（eval_skipped + 已验证的）
         remaining = [
             f["id"] for f in state.findings
-            if f["id"] not in state.results or f["id"] not in already_skipped
+            if f["id"] not in state.results
         ]
+        skipped_count = sum(
+            1 for r in state.results.values()
+            if (r.get("status") if isinstance(r, dict) else getattr(r, "status", "")) == "eval_skipped"
+        )
         if remaining:
-            print(f"\n=== R4：红绿验证（{len(remaining)} 个 bug，{len(already_skipped)} 个已被 R3 跳过） ===\n")
+            print(f"\n=== R4：红绿验证（{len(remaining)} 个 bug，{skipped_count} 个已被 R3 跳过） ===\n")
             from lib.steps.verify import run_verify
             run_verify(state, project_root, remaining, modules_by_name)
             state.save(state.state_file(project_root))

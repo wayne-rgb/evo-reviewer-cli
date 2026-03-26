@@ -25,17 +25,15 @@ def run_organize(state, project_root):
     findings = state.findings
 
     if len(findings) <= _BATCH_SIZE:
-        # 单批直接调用
-        gaps = _call_organize(findings, call_claude_bare, ORGANIZE_PROMPT, GAPS_SCHEMA)
+        gaps = _call_organize(findings)
     else:
-        # 分批归类
         all_gaps = []
         for i in range(0, len(findings), _BATCH_SIZE):
             batch = findings[i:i + _BATCH_SIZE]
             batch_num = i // _BATCH_SIZE + 1
             total_batches = (len(findings) + _BATCH_SIZE - 1) // _BATCH_SIZE
             logger.info("organize 分批 %d/%d（%d 个 findings）", batch_num, total_batches, len(batch))
-            batch_gaps = _call_organize(batch, call_claude_bare, ORGANIZE_PROMPT, GAPS_SCHEMA)
+            batch_gaps = _call_organize(batch)
             all_gaps.extend(batch_gaps)
 
         # 跨批合并同名 gap
@@ -47,8 +45,12 @@ def run_organize(state, project_root):
     return gaps
 
 
-def _call_organize(findings, call_claude_bare, prompt_template, schema):
+def _call_organize(findings):
     """对一批 findings 调用 claude 归类"""
+    from lib.claude import call_claude_bare
+    from lib.prompts.organize import ORGANIZE_PROMPT
+    from lib.schemas.gaps import GAPS_SCHEMA
+
     findings_json = json.dumps(findings, ensure_ascii=False, indent=2)
 
     # 动态超时：基础 120s + 每个 finding 10s，下限 300s 上限 900s
@@ -57,10 +59,10 @@ def _call_organize(findings, call_claude_bare, prompt_template, schema):
     logger.info("organize 超时: %ds（%d 个 findings）", timeout, len(findings))
 
     result = call_claude_bare(
-        prompt=prompt_template.format(findings_json=findings_json),
+        prompt=ORGANIZE_PROMPT.format(findings_json=findings_json),
         model="opus",
         tools="",
-        output_schema=schema,
+        output_schema=GAPS_SCHEMA,
         max_turns=5,
         timeout=timeout,
     )
@@ -87,9 +89,8 @@ def _merge_gaps(gaps):
             new_ids = set(g.get("evidence_finding_ids", []))
             existing["evidence_finding_ids"] = sorted(existing_ids | new_ids)
         else:
-            merged[key] = dict(g)  # 拷贝
+            merged[key] = dict(g)
 
-    # 重新分配 ID
     result = []
     for i, g in enumerate(merged.values(), 1):
         g["id"] = f"G{i}"

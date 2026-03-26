@@ -83,6 +83,13 @@ def _verify_module(state, project_root, mod_name, bugs, wt, module):
     active_bugs = bugs[:MAX_BUGS_PER_MODULE]
     overflow = bugs[MAX_BUGS_PER_MODULE:]
 
+    if overflow:
+        logger.warning(
+            "%s: %d 个 bug 超出模块上限（MAX=%d），跳过：%s",
+            mod_name, len(overflow), MAX_BUGS_PER_MODULE,
+            ", ".join(b["id"] for b in overflow),
+        )
+        print(f"  ⚠️ {mod_name}: 跳过 {len(overflow)} 个 bug（超出模块上限 {MAX_BUGS_PER_MODULE}）")
     for bug in overflow:
         with _results_lock:
             state.results[bug["id"]] = {"status": "skipped", "reason": "超出模块上限"}

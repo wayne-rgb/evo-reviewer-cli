@@ -45,7 +45,7 @@ EVALUATE_SCHEMA = {
                         "description": "重新评估后的实际严重度"
                     }
                 },
-                "required": ["id", "verdict", "trigger_probability", "trigger_scenario", "user_impact", "derivative_impact", "reason", "actual_severity"]
+                "required": ["id", "verdict", "trigger_probability", "trigger_scenario", "user_impact", "existing_protection", "derivative_impact", "reason", "actual_severity"]
             }
         }
     },
