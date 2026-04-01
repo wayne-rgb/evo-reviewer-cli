@@ -756,6 +756,28 @@ def cmd_ci(args):
     return 0 if ok else 1
 
 
+# ==================== cover ====================
+
+def cmd_cover(args):
+    """执行 evo-cli cover：分析跨模块测试覆盖缺口并生成集成测试。"""
+    import time
+    from lib.steps.cover import run_cover
+
+    project_root = _detect_project_root()
+    logger.info(f"项目根目录：{project_root}")
+
+    module_filter = None
+    if hasattr(args, "modules") and args.modules:
+        module_filter = [m.strip() for m in args.modules.split(",")]
+
+    start_time = time.time()
+    ok = run_cover(project_root, module_filter=module_filter)
+
+    elapsed = (time.time() - start_time) / 60
+    print(f"\n总耗时：{elapsed:.1f} 分钟")
+    return 0 if ok else 1
+
+
 # ==================== trend ====================
 
 def cmd_trend(args):
@@ -930,6 +952,11 @@ def main():
     p_resume.add_argument("--until", choices=VALID_STAGES, help="执行到指定阶段后停止")
     p_resume.add_argument("--confirmed", help="确认的 finding ID 列表（逗号分隔，如 F1,F2,F3）")
     p_resume.set_defaults(func=cmd_resume)
+
+    # cover
+    p_cover = subparsers.add_parser("cover", help="分析跨模块测试覆盖缺口并生成集成测试")
+    p_cover.add_argument("--modules", help="限定模块（逗号分隔，如 togo-agent,agentapi）")
+    p_cover.set_defaults(func=cmd_cover)
 
     # trend
     p_trend = subparsers.add_parser("trend", help="查看历次 review 的趋势分析")
