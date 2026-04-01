@@ -1,14 +1,17 @@
 """cover 命令：分析跨模块测试覆盖缺口，自动生成集成测试
 
 流程：
-Phase 1: 分析覆盖缺口（一次 Claude bare 调用）
-Phase 2: 逐个生成测试（并行 Claude session 调用，worktree 内工作）
-Phase 3: 合并 worktree + 跑一次 cross 测试确认不破坏已有
+Phase 1: 覆盖分析 — 构建覆盖矩阵（模块边界对 × 6 测试维度）
+Phase 2: 缺口排序 — P0 > 边界无测试 > 缺维度，结合 trend 弱点
+Phase 3: 确认 — 展示计划，用户确认后继续
+Phase 4: 测试生成 — worktree 内并行生成，每个绿灯验证
+Phase 5: 合并 + 报告 — 合并回主分支，跑 cross 测试，输出报告
 """
 
 import logging
 import os
 import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -18,6 +21,25 @@ logger = logging.getLogger(__name__)
 MAX_WORKERS = 3
 # 保护并发写入
 _lock = threading.Lock()
+
+# 6 个测试维度
+DIMENSIONS = [
+    "happy_path",
+    "cleanup",
+    "concurrency",
+    "error_recovery",
+    "security_boundary",
+    "fault_tolerance",
+]
+
+DIMENSION_LABELS = {
+    "happy_path": "正常路径",
+    "cleanup": "副作用清理",
+    "concurrency": "并发安全",
+    "error_recovery": "错误恢复",
+    "security_boundary": "安全边界",
+    "fault_tolerance": "故障后可用",
+}
 
 
 def run_cover(project_root, module_filter=None):
@@ -42,79 +64,71 @@ def run_cover(project_root, module_filter=None):
 
     print(f"分析模块：{', '.join(m.name for m in modules)}")
 
-    # === Phase 1: 分析覆盖缺口 ===
+    # === Phase 1: 覆盖分析 ===
     print("\n=== Phase 1：覆盖分析 ===\n")
-    gaps = _analyze_coverage(project_root, modules)
+    analysis = _analyze_coverage(project_root, modules)
+    if analysis is None:
+        return False
+
+    gaps = analysis["gaps"]
+    matrix = analysis.get("coverage_matrix", [])
+    summary = analysis.get("coverage_summary", {})
+
+    # 打印覆盖矩阵
+    _print_coverage_matrix(matrix, summary)
 
     if not gaps:
-        print("跨模块测试覆盖完整，无需补充。")
+        print("\n跨模块测试覆盖完整，无需补充。")
         return True
 
-    print(f"发现 {len(gaps)} 个覆盖缺口：")
-    for g in gaps:
-        print(f"  [{g['id']}] {g['priority']} | {g['module_pair']} | {g['dimension']}")
-        print(f"         {g['scenario']}")
+    # === Phase 2: 缺口排序 ===
+    print("\n=== Phase 2：缺口排序 ===\n")
+    gaps = _prioritize_gaps(gaps, project_root)
+    _print_gap_plan(gaps)
 
-    # === Phase 2: 生成测试 ===
-    print(f"\n=== Phase 2：生成测试（{len(gaps)} 个） ===\n")
+    # === Phase 3: 确认 ===
+    print("\n=== Phase 3：确认 ===\n")
+    if not _confirm_plan(gaps):
+        print("已取消。")
+        return True
+
+    # === Phase 4: 测试生成 ===
+    print(f"\n=== Phase 4：测试生成（{len(gaps)} 个） ===\n")
     results = _generate_tests(project_root, modules, gaps)
 
-    # 统计
     success = sum(1 for r in results.values() if r["status"] == "ok")
     failed = sum(1 for r in results.values() if r["status"] == "failed")
-    skipped = sum(1 for r in results.values() if r["status"] == "skipped")
 
-    # === Phase 3: 合并 + 验证 ===
+    # === Phase 5: 合并 + 报告 ===
     if success > 0:
-        print(f"\n=== Phase 3：合并 + 验证 ===\n")
+        print(f"\n=== Phase 5：合并 + 验证 ===\n")
         _merge_and_verify(project_root, modules)
 
-    # === 报告 ===
-    print(f"\n{'='*60}")
-    print(f"  Cover 完成：{success} 个测试生成成功，{failed} 失败，{skipped} 跳过")
-    print(f"{'='*60}")
+    _print_report(results, gaps)
+    return True
 
-    if success > 0:
-        print("\n新增的测试文件：")
-        for gap_id, r in results.items():
-            if r["status"] == "ok":
-                print(f"  {r.get('test_file', '?')}")
 
-    if failed > 0:
-        print("\n失败的缺口：")
-        for gap_id, r in results.items():
-            if r["status"] == "failed":
-                print(f"  [{gap_id}] {r.get('reason', '?')}")
-
-    return failed == 0
-
+# ==================== Phase 1: 覆盖分析 ====================
 
 def _analyze_coverage(project_root, modules):
     """Phase 1：分析覆盖缺口。
 
-    一次 Claude bare 调用（opus），读已有测试 + 源码边界，输出缺口清单。
+    一次 Claude bare 调用（opus），读已有测试 + 源码边界 + P0 + trend，
+    输出覆盖矩阵和缺口清单。
     """
     from lib.claude import call_claude_bare
     from lib.prompts.cover import ANALYZE_COVERAGE_PROMPT
     from lib.schemas.cover import COVERAGE_GAPS_SCHEMA
 
-    # 1. 构建模块信息
     modules_info = "\n".join(
         f"- **{m.name}**（{m.language}）: `{m.src_dir}` | 测试: `{m.test_dir}`"
         for m in modules
     )
-
-    # 2. 读拓扑
     topology_summary = _read_topology(project_root)
-
-    # 3. 读 P0 场景
     p0_cases = _read_p0_cases(project_root)
-
-    # 4. 提取现有跨模块测试的场景描述（轻量：只读 describe/it，不读实现）
     existing_tests = _extract_existing_tests(project_root)
-
-    # 5. 提取 helper 能力摘要
     helpers_summary = _extract_helpers(project_root)
+    trend_weaknesses = _read_trend_weaknesses(project_root)
 
     prompt = ANALYZE_COVERAGE_PROMPT.format(
         modules_info=modules_info,
@@ -122,9 +136,9 @@ def _analyze_coverage(project_root, modules):
         p0_cases=p0_cases if p0_cases else "无 P0 场景定义",
         existing_tests=existing_tests if existing_tests else "无现有跨模块测试",
         helpers_summary=helpers_summary if helpers_summary else "无测试 helper",
+        trend_weaknesses=trend_weaknesses if trend_weaknesses else "无历史趋势数据",
     )
 
-    # 估算 timeout：模块数 × 基数
     timeout = min(max(600, len(modules) * 300), 1800)
 
     try:
@@ -139,43 +153,112 @@ def _analyze_coverage(project_root, modules):
         )
     except Exception as e:
         logger.error("覆盖分析失败: %s", e)
-        return []
+        return None
 
     gaps = result.get("gaps", [])
-    summary = result.get("coverage_summary", {})
-
-    if summary:
-        print(f"覆盖概况：{summary.get('existing_test_count', '?')} 个现有测试，"
-              f"{summary.get('covered_pairs', '?')}/{summary.get('total_boundary_pairs', '?')} 个边界对已覆盖")
-        dim_cov = summary.get("dimension_coverage", {})
-        if dim_cov:
-            print("维度覆盖：" + "  ".join(f"{d}={n}" for d, n in dim_cov.items()))
-
     # 全局重编号
     for i, g in enumerate(gaps, 1):
         g["id"] = f"G{i}"
 
+    return result
+
+
+# ==================== Phase 2: 缺口排序 ====================
+
+def _prioritize_gaps(gaps, project_root):
+    """Phase 2：结合 trend 数据对缺口排序。
+
+    排序规则：
+    1. P0 > P1 > P2
+    2. 同优先级内，trend 弱项 category 优先
+    3. 同优先级同 category，error_recovery/concurrency/fault_tolerance 维度优先
+    """
+    priority_order = {"P0": 0, "P1": 1, "P2": 2}
+    # 高价值维度排前面
+    dimension_order = {
+        "error_recovery": 0,
+        "concurrency": 1,
+        "fault_tolerance": 2,
+        "security_boundary": 3,
+        "cleanup": 4,
+        "happy_path": 5,
+    }
+
+    # 从 trend 读取弱项 category（幻觉率高的排前面）
+    weak_categories = _get_weak_categories(project_root)
+
+    def sort_key(gap):
+        p = priority_order.get(gap.get("priority", "P2"), 2)
+        # 弱项 category boost（在 weak_categories 中的排前面）
+        cat_boost = 0 if gap.get("module_pair", "") in weak_categories else 1
+        d = dimension_order.get(gap.get("dimension", "happy_path"), 5)
+        return (p, cat_boost, d)
+
+    gaps.sort(key=sort_key)
     return gaps
 
 
-def _generate_tests(project_root, modules, gaps):
-    """Phase 2：为每个缺口生成测试（并行）。
+def _get_weak_categories(project_root):
+    """从 history.jsonl 读取弱项（幻觉率 > 50% 的 category）。"""
+    try:
+        from lib.steps.history import load_history
+        entries = load_history(project_root)
+        if not entries:
+            return set()
 
-    在 worktree 中工作，每个缺口一次 Claude session 调用。
+        from collections import defaultdict
+        cat_stats = defaultdict(lambda: {"verified": 0, "hallucination": 0})
+        for e in entries[-20:]:  # 最近 20 次
+            for cat, stats in e.get("by_category", {}).items():
+                cat_stats[cat]["verified"] += stats.get("verified", 0)
+                cat_stats[cat]["hallucination"] += stats.get("hallucination", 0)
+
+        weak = set()
+        for cat, stats in cat_stats.items():
+            total = stats["verified"] + stats["hallucination"]
+            if total >= 3 and stats["hallucination"] / total > 0.5:
+                weak.add(cat)
+        return weak
+    except Exception:
+        return set()
+
+
+# ==================== Phase 3: 确认 ====================
+
+def _confirm_plan(gaps):
+    """Phase 3：展示计划，等待用户确认。
+
+    在 Claude Code 的 skill 调用中，stdin 不可用，此时自动确认。
     """
+    print(f"共 {len(gaps)} 个缺口将生成集成测试。")
+    print("确认后开始生成（每个缺口约 2-5 分钟）。\n")
+
+    # 检测是否在非交互模式（如被 Claude skill 调用）
+    if not sys.stdin.isatty():
+        print("（非交互模式，自动确认）")
+        return True
+
+    try:
+        answer = input("继续？[Y/n] ").strip().lower()
+        return answer in ("", "y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        return False
+
+
+# ==================== Phase 4: 测试生成 ====================
+
+def _generate_tests(project_root, modules, gaps):
+    """Phase 4：为每个缺口生成测试（并行）。"""
     from lib.worktree import create_worktree, commit_in_worktree
 
-    # 找到跨模块测试所在的模块（通常是主模块，如 togo-agent）
     test_module = _find_cross_test_module(project_root, modules)
     if not test_module:
         logger.error("未找到跨模块测试目录")
         return {}
 
-    # 创建 worktree
     wt = create_worktree("cover", project_root)
     logger.info("worktree 已创建：%s", wt.path)
 
-    # 读一个现有测试作为模式参考
     test_pattern = _read_test_pattern(project_root, test_module)
     helpers_available = _extract_helpers(project_root)
 
@@ -207,7 +290,6 @@ def _generate_tests(project_root, modules, gaps):
                 with _lock:
                     results[gap_id] = {"status": "failed", "reason": str(e)}
 
-    # 提交所有成功的测试
     has_ok = any(r["status"] == "ok" for r in results.values())
     if has_ok:
         commit_in_worktree(wt, "evo-cover: 新增跨模块集成测试")
@@ -218,11 +300,7 @@ def _generate_tests(project_root, modules, gaps):
 def _generate_single_test(gap, wt, test_module, project_root, test_pattern, helpers_available):
     """为单个缺口生成测试文件。
 
-    流程：
-    1. Claude session 写测试
-    2. 跑测试验证绿灯
-    3. 失败则修一次
-    4. 仍失败则跳过
+    流程：写测试 → 跑绿灯 → 失败修一次 → 仍失败删除
     """
     from lib.claude import call_claude_session
     from lib.prompts.cover import GENERATE_TEST_PROMPT, FIX_TEST_PROMPT
@@ -230,7 +308,6 @@ def _generate_single_test(gap, wt, test_module, project_root, test_pattern, help
     gap_id = gap["id"]
     timeout = test_module.estimate_timeout(project_root, task="verify")
 
-    # 1. 生成测试
     prompt = GENERATE_TEST_PROMPT.format(
         gap_id=gap_id,
         module_pair=gap.get("module_pair", ""),
@@ -254,17 +331,15 @@ def _generate_single_test(gap, wt, test_module, project_root, test_pattern, help
     except Exception as e:
         return {"status": "failed", "reason": f"生成失败: {e}"}
 
-    # 2. 找到新写的测试文件
     test_file = _find_new_test_file(wt.path, gap_id, test_module)
     if not test_file:
         return {"status": "failed", "reason": "未找到生成的测试文件"}
 
-    # 3. 跑测试
     test_result = _run_single_test(wt.path, test_file, test_module)
     if test_result["exit_code"] == 0:
         return {"status": "ok", "test_file": test_file}
 
-    # 4. 修一次
+    # 修一次
     logger.info("[%s] 测试失败，尝试修复", gap_id)
     fix_prompt = FIX_TEST_PROMPT.format(
         gap_id=gap_id,
@@ -284,12 +359,11 @@ def _generate_single_test(gap, wt, test_module, project_root, test_pattern, help
     except Exception as e:
         return {"status": "failed", "reason": f"修复失败: {e}", "test_file": test_file}
 
-    # 5. 重跑
     retry_result = _run_single_test(wt.path, test_file, test_module)
     if retry_result["exit_code"] == 0:
         return {"status": "ok", "test_file": test_file}
 
-    # 仍失败 → 删除测试文件，避免合并坏测试
+    # 删除失败的测试文件
     abs_path = os.path.join(wt.path, test_file)
     if os.path.exists(abs_path):
         os.remove(abs_path)
@@ -298,8 +372,10 @@ def _generate_single_test(gap, wt, test_module, project_root, test_pattern, help
     return {"status": "failed", "reason": "修复后测试仍失败", "test_file": test_file}
 
 
+# ==================== Phase 5: 合并 + 报告 ====================
+
 def _merge_and_verify(project_root, modules):
-    """Phase 3：合并 worktree，跑一次 cross 测试确认不破坏已有。"""
+    """Phase 5：合并 worktree，跑一次 cross 测试确认不破坏已有。"""
     from lib.worktree import merge_worktree, Worktree
 
     wt_path = os.path.join(project_root, ".evo-review", "worktrees", "cover")
@@ -307,7 +383,6 @@ def _merge_and_verify(project_root, modules):
         logger.warning("cover worktree 不存在，跳过合并")
         return
 
-    # 读取 worktree 分支名
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
@@ -322,7 +397,6 @@ def _merge_and_verify(project_root, modules):
     merge_worktree(wt, project_root)
     print("worktree 已合并")
 
-    # 跑 cross 测试验证
     test_module = _find_cross_test_module(project_root, modules)
     if test_module and test_module.cross_command:
         print(f"运行 cross 测试验证：{test_module.cross_command}")
@@ -341,14 +415,100 @@ def _merge_and_verify(project_root, modules):
             print(f"cross 测试有失败（exit {result.returncode}）")
 
 
-# ==================== 辅助函数 ====================
+def _print_coverage_matrix(matrix, summary):
+    """打印覆盖矩阵。"""
+    if not matrix:
+        if summary:
+            print(f"覆盖概况：{summary.get('existing_test_count', '?')} 个现有测试，"
+                  f"{summary.get('covered_pairs', '?')}/{summary.get('total_boundary_pairs', '?')} 个边界对已覆盖")
+            dim_cov = summary.get("dimension_coverage", {})
+            if dim_cov:
+                print("维度覆盖：" + "  ".join(
+                    f"{DIMENSION_LABELS.get(d, d)}={n}" for d, n in dim_cov.items()
+                ))
+        return
+
+    # 打印矩阵表格
+    print("覆盖矩阵（已覆盖/未覆盖）：\n")
+
+    # 表头
+    dim_short = ["正常", "清理", "并发", "错误", "安全", "容错"]
+    header = f"  {'模块边界对':<30s}  " + "  ".join(f"{d:>4s}" for d in dim_short)
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+
+    for row in matrix:
+        pair = row.get("module_pair", "?")[:30]
+        cells = []
+        for dim in DIMENSIONS:
+            covered = row.get("dimensions", {}).get(dim, False)
+            cells.append("  ++" if covered else "  --")
+        print(f"  {pair:<30s}{''.join(cells)}")
+
+    print()
+    if summary:
+        total = summary.get("total_boundary_pairs", 0)
+        covered = summary.get("covered_pairs", 0)
+        if total > 0:
+            pct = covered * 100 // total
+            print(f"  边界对覆盖率：{covered}/{total}（{pct}%）")
+
+
+def _print_gap_plan(gaps):
+    """打印排序后的缺口计划。"""
+    by_priority = {"P0": [], "P1": [], "P2": []}
+    for g in gaps:
+        by_priority.get(g.get("priority", "P2"), by_priority["P2"]).append(g)
+
+    for pri in ("P0", "P1", "P2"):
+        items = by_priority[pri]
+        if not items:
+            continue
+        print(f"\n{pri}（{len(items)} 个）：")
+        for g in items:
+            dim_label = DIMENSION_LABELS.get(g.get("dimension", ""), g.get("dimension", ""))
+            print(f"  [{g['id']}] {g['module_pair']} | {dim_label}")
+            print(f"         {g['scenario']}")
+
+
+def _print_report(results, gaps):
+    """打印最终报告。"""
+    success = sum(1 for r in results.values() if r["status"] == "ok")
+    failed = sum(1 for r in results.values() if r["status"] == "failed")
+
+    print(f"\n{'='*60}")
+    print(f"  Cover 完成：{success} 个测试生成成功，{failed} 个失败")
+    print(f"{'='*60}")
+
+    if success > 0:
+        print("\n新增的测试文件：")
+        for gap_id, r in results.items():
+            if r["status"] == "ok":
+                # 找到对应的 gap 描述
+                gap_desc = ""
+                for g in gaps:
+                    if g["id"] == gap_id:
+                        gap_desc = g.get("scenario", "")[:60]
+                        break
+                print(f"  [{gap_id}] {r.get('test_file', '?')}")
+                if gap_desc:
+                    print(f"         {gap_desc}")
+
+    if failed > 0:
+        print("\n失败的缺口（下次 cover 会重新尝试）：")
+        for gap_id, r in results.items():
+            if r["status"] == "failed":
+                print(f"  [{gap_id}] {r.get('reason', '?')}")
+
+
+# ==================== 数据读取函数 ====================
 
 def _read_topology(project_root):
     """读取 cross-module-topology.md"""
     topo_path = os.path.join(project_root, "test-governance", "cross-module-topology.md")
     if os.path.isfile(topo_path):
         with open(topo_path, "r", encoding="utf-8") as f:
-            return f.read()[:5000]  # 截断防止过长
+            return f.read()[:5000]
     return "未找到 cross-module-topology.md"
 
 
@@ -361,12 +521,39 @@ def _read_p0_cases(project_root):
     return ""
 
 
-def _extract_existing_tests(project_root):
-    """提取现有跨模块测试的 describe/it 描述（轻量，不读实现）。
+def _read_trend_weaknesses(project_root):
+    """从 history.jsonl 读取 trend 弱点信息，供分析阶段参考。"""
+    try:
+        from lib.steps.history import load_history
+        entries = load_history(project_root)
+        if not entries:
+            return ""
 
-    用 grep 提取 describe() 和 it() 行，每个文件列出测试场景名。
-    """
-    # 查找所有 cross-module 测试文件
+        from collections import defaultdict
+        cat_stats = defaultdict(lambda: {"verified": 0, "hallucination": 0, "total": 0})
+        for e in entries[-20:]:
+            for cat, stats in e.get("by_category", {}).items():
+                cat_stats[cat]["verified"] += stats.get("verified", 0)
+                cat_stats[cat]["hallucination"] += stats.get("hallucination", 0)
+                cat_stats[cat]["total"] += stats.get("total", 0)
+
+        lines = ["## 历史 Review 趋势（category 弱点）\n"]
+        lines.append("以下 category 在历次 review 中幻觉率较高，生成测试时应优先覆盖：\n")
+        for cat, stats in sorted(cat_stats.items(), key=lambda x: -x[1]["hallucination"]):
+            decidable = stats["verified"] + stats["hallucination"]
+            if decidable >= 2:
+                hallu_rate = stats["hallucination"] / decidable
+                lines.append(
+                    f"- {cat}: {hallu_rate*100:.0f}% 幻觉率 "
+                    f"({stats['verified']}/{decidable} verified)"
+                )
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
+def _extract_existing_tests(project_root):
+    """提取现有跨模块测试的 describe/it 描述（轻量，不读实现）。"""
     test_dirs = _find_cross_test_dirs(project_root)
     if not test_dirs:
         return ""
@@ -380,7 +567,6 @@ def _extract_existing_tests(project_root):
                 capture_output=True, text=True, timeout=15,
             )
             if result.stdout:
-                # 按文件分组
                 current_file = None
                 for line in result.stdout.strip().split("\n"):
                     parts = line.split(":", 2)
@@ -389,7 +575,6 @@ def _extract_existing_tests(project_root):
                         if fpath != current_file:
                             current_file = fpath
                             lines.append(f"\n### {current_file}")
-                        # 只保留 describe/it 名称
                         content = parts[2].strip()
                         lines.append(f"  {content}")
         except Exception as e:
@@ -430,11 +615,12 @@ def _extract_helpers(project_root):
     return "\n".join(lines) if lines else ""
 
 
+# ==================== 文件查找函数 ====================
+
 def _find_cross_test_dirs(project_root):
     """查找包含跨模块测试文件的目录。"""
     dirs = []
     for root, dirnames, files in os.walk(project_root):
-        # 跳过常见无关目录
         dirnames[:] = [d for d in dirnames if d not in (
             "node_modules", ".git", ".evo-review", "dist", "build",
             ".build", "DerivedData", "vendor",
@@ -463,7 +649,6 @@ def _find_cross_test_module(project_root, modules):
     for m in modules:
         if m.cross_command:
             return m
-    # fallback：第一个有 test_dir 的模块
     for m in modules:
         if m.test_dir:
             return m
@@ -480,8 +665,8 @@ def _read_test_pattern(project_root, test_module):
                 try:
                     with open(fpath, "r", encoding="utf-8") as fh:
                         content = fh.read()
-                    if len(content) > 500:  # 跳过太短的
-                        return content[:4000]  # 只取前 4000 字符作为参考
+                    if len(content) > 500:
+                        return content[:4000]
                 except Exception:
                     continue
     return ""
@@ -489,7 +674,6 @@ def _read_test_pattern(project_root, test_module):
 
 def _find_new_test_file(wt_path, gap_id, test_module):
     """在 worktree 中查找新生成的测试文件。"""
-    # 策略 1：查找 gap_id 命名的文件
     gap_lower = gap_id.lower()
     result = subprocess.run(
         ["git", "ls-files", "--others", "--exclude-standard"],
@@ -497,17 +681,14 @@ def _find_new_test_file(wt_path, gap_id, test_module):
     )
     new_files = [f for f in result.stdout.strip().split("\n") if f]
 
-    # 优先找包含 gap_id 或 cover 的测试文件
     for f in new_files:
         if f.endswith((".test.ts", ".test.js")) and ("cover" in f or gap_lower in f.lower()):
             return f
 
-    # fallback：任何新的测试文件
     for f in new_files:
         if f.endswith((".test.ts", ".test.js")) and "cross-module" in f:
             return f
 
-    # 策略 2：查找修改的文件
     result = subprocess.run(
         ["git", "diff", "--name-only"],
         cwd=wt_path, capture_output=True, text=True,
@@ -521,10 +702,8 @@ def _find_new_test_file(wt_path, gap_id, test_module):
 
 def _run_single_test(wt_path, test_file, module):
     """在 worktree 中运行单个测试文件。"""
-    # 确定模块目录
     mod_dir = wt_path
     if module.src_dir:
-        # src_dir 如 "togo-agent/src/" → 模块根目录 "togo-agent"
         mod_root = module.src_dir.rstrip("/").split("/")[0]
         candidate = os.path.join(wt_path, mod_root)
         if os.path.isdir(candidate):

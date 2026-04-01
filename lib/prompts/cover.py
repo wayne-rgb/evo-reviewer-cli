@@ -18,6 +18,8 @@ ANALYZE_COVERAGE_PROMPT = """你是跨模块集成测试专家。请分析当前
 ## 现有测试 helper 能力
 {helpers_summary}
 
+{trend_weaknesses}
+
 ## 分析方法
 
 ### 第一步：构建覆盖矩阵
@@ -52,10 +54,20 @@ ANALYZE_COVERAGE_PROMPT = """你是跨模块集成测试专家。请分析当前
 - 相关源码文件路径
 
 ## 输出要求
+
+### coverage_matrix（必须）
+输出完整的覆盖矩阵：列出所有识别到的模块边界对，每个边界对标注 6 个维度的覆盖状态（true/false）。
+这个矩阵应该反映你实际读代码确认的结果，不要猜测。
+
+### gaps（必须）
 - 不要报告已有测试已经覆盖的场景
 - 不要报告纯单元测试范畴的问题（那是 test-check 的职责）
 - 每个缺口的 scenario 必须足够具体，能直接据此写测试
-- test_hint 必须引用已有的 helper 函数名（如 createAuthenticatedClient、createFailAfterNMock）"""
+- test_hint 必须引用项目中已有的 helper 函数名（如果有）
+- 如果趋势数据显示某个 category 幻觉率高，优先为该 category 生成更精确的测试场景
+
+### coverage_summary（必须）
+汇总统计：总边界对数、已覆盖数、现有测试文件数、各维度覆盖数。"""
 
 # Phase 2：为单个缺口生成集成测试
 GENERATE_TEST_PROMPT = """请为以下跨模块测试缺口编写集成测试。

@@ -1,9 +1,35 @@
 """cover 命令的 JSON Schema 定义"""
 
-# Phase 1 输出：覆盖缺口清单
+# Phase 1 输出：覆盖矩阵 + 缺口清单
 COVERAGE_GAPS_SCHEMA = {
     "type": "object",
     "properties": {
+        "coverage_matrix": {
+            "type": "array",
+            "description": "覆盖矩阵：每个模块边界对在 6 个测试维度上的覆盖情况",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "module_pair": {
+                        "type": "string",
+                        "description": "模块边界对，如 'websocket ↔ cli'"
+                    },
+                    "dimensions": {
+                        "type": "object",
+                        "description": "各维度覆盖情况（true=已覆盖，false=未覆盖）",
+                        "properties": {
+                            "happy_path": {"type": "boolean"},
+                            "cleanup": {"type": "boolean"},
+                            "concurrency": {"type": "boolean"},
+                            "error_recovery": {"type": "boolean"},
+                            "security_boundary": {"type": "boolean"},
+                            "fault_tolerance": {"type": "boolean"}
+                        }
+                    }
+                },
+                "required": ["module_pair", "dimensions"]
+            }
+        },
         "gaps": {
             "type": "array",
             "items": {
@@ -15,7 +41,7 @@ COVERAGE_GAPS_SCHEMA = {
                     },
                     "module_pair": {
                         "type": "string",
-                        "description": "模块边界对，如 'websocket ↔ cli' 或 'http ↔ config'"
+                        "description": "模块边界对，如 'websocket ↔ cli'"
                     },
                     "scenario": {
                         "type": "string",
@@ -36,11 +62,11 @@ COVERAGE_GAPS_SCHEMA = {
                     "priority": {
                         "type": "string",
                         "enum": ["P0", "P1", "P2"],
-                        "description": "优先级：P0=P0 场景未覆盖，P1=模块边界无测试，P2=已有测试缺维度"
+                        "description": "P0=P0 场景未覆盖，P1=模块边界无测试，P2=已有测试缺维度"
                     },
                     "why_missing": {
                         "type": "string",
-                        "description": "为什么现有测试没覆盖到（简要）"
+                        "description": "为什么现有测试没覆盖到"
                     },
                     "test_hint": {
                         "type": "string",
@@ -49,7 +75,7 @@ COVERAGE_GAPS_SCHEMA = {
                     "related_source_files": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "需要读取的源码文件路径（写测试时作为上下文）"
+                        "description": "需要读取的源码文件路径"
                     }
                 },
                 "required": ["id", "module_pair", "scenario", "dimension", "priority", "test_hint"]
@@ -65,7 +91,7 @@ COVERAGE_GAPS_SCHEMA = {
                 },
                 "covered_pairs": {
                     "type": "integer",
-                    "description": "已有测试覆盖的边界对数"
+                    "description": "至少有一个维度被覆盖的边界对数"
                 },
                 "existing_test_count": {
                     "type": "integer",
@@ -73,11 +99,11 @@ COVERAGE_GAPS_SCHEMA = {
                 },
                 "dimension_coverage": {
                     "type": "object",
-                    "description": "各维度覆盖情况，如 {'happy_path': 25, 'error_recovery': 8}",
+                    "description": "各维度被覆盖的边界对数，如 {'happy_path': 5, 'error_recovery': 2}",
                     "additionalProperties": {"type": "integer"}
                 }
             }
         }
     },
-    "required": ["gaps", "coverage_summary"]
+    "required": ["coverage_matrix", "gaps", "coverage_summary"]
 }
