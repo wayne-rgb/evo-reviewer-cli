@@ -748,12 +748,29 @@ def cmd_test_check(args):
 
 
 def cmd_ci(args):
-    """执行 /ci"""
+    """执行 /ci，支持 --auto-fix 修复循环。"""
     from lib.steps.ci import run_ci
 
     project_root = _detect_project_root()
-    ok = run_ci(project_root)
-    return 0 if ok else 1
+    auto_fix = getattr(args, "auto_fix", False)
+    diff_base = getattr(args, "diff_base", None)
+
+    if auto_fix:
+        pending_file = os.path.join(
+            project_root, ".evo-review", "pending-decisions.md"
+        )
+        ok, pending = run_ci(
+            project_root,
+            auto_fix=True,
+            pending_file=pending_file,
+            diff_base=diff_base,
+        )
+        if pending:
+            print(f"\n待决问题文件：{pending_file}")
+        return 0 if ok else 1
+    else:
+        ok = run_ci(project_root, diff_base=diff_base)
+        return 0 if ok else 1
 
 
 # ==================== cover ====================
@@ -945,6 +962,9 @@ def main():
 
     # ci
     p_ci = subparsers.add_parser("ci", help="CI 验证")
+    p_ci.add_argument("--auto-fix", action="store_true",
+                       help="测试失败时自动修复（worktree 内 AI 修复 → 回归，最多 3 轮）")
+    p_ci.add_argument("--diff-base", help="diff 基准（默认 HEAD~1），如 HEAD~5 或 commit hash")
     p_ci.set_defaults(func=cmd_ci)
 
     # resume
