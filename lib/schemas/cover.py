@@ -14,6 +14,15 @@ COVERAGE_GAPS_SCHEMA = {
                         "type": "string",
                         "description": "模块边界对，如 'websocket ↔ cli'"
                     },
+                    "chain_name": {
+                        "type": "string",
+                        "description": "业务链路名称，如 '用户创建订单链路'"
+                    },
+                    "module_chain": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "完整链路节点序列，如 ['客户端', 'API Gateway', 'order-service', 'payment', 'DB']"
+                    },
                     "dimensions": {
                         "type": "object",
                         "description": "各维度覆盖情况（true=已覆盖，false=未覆盖）",
@@ -42,6 +51,15 @@ COVERAGE_GAPS_SCHEMA = {
                     "module_pair": {
                         "type": "string",
                         "description": "模块边界对，如 'websocket ↔ cli'"
+                    },
+                    "module_chain": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "缺口所属的完整业务链路节点序列"
+                    },
+                    "gap_segment": {
+                        "type": "string",
+                        "description": "链路中具体断裂的段，如 'service-handler → data-layer'"
                     },
                     "scenario": {
                         "type": "string",
@@ -101,6 +119,14 @@ COVERAGE_GAPS_SCHEMA = {
                     "type": "object",
                     "description": "各维度被覆盖的边界对数，如 {'happy_path': 5, 'error_recovery': 2}",
                     "additionalProperties": {"type": "integer"}
+                },
+                "total_chains": {
+                    "type": "integer",
+                    "description": "识别到的端到端业务链路数"
+                },
+                "fully_covered_chains": {
+                    "type": "integer",
+                    "description": "所有维度都覆盖的链路数"
                 }
             }
         }

@@ -120,11 +120,11 @@ def _parse_topology(project_root):
 
     返回 dict，结构：
     {
-        "togo-agent": {
-            "iOS-app": {
-                "shared_types": ["togo-agent/src/types/index.ts"],
+        "module_a": {
+            "module_b": {
+                "shared_types": ["module_a/src/types/index.ts"],
                 "counterparts": {
-                    "togo-agent/src/types/index.ts": ["iOS-app/Packages/.../Message.swift"],
+                    "module_a/src/types/index.ts": ["module_b/src/Message.swift"],
                 },
                 "protocols": ["WebSocket"],
             },
@@ -133,16 +133,17 @@ def _parse_topology(project_root):
         ...
     }
 
-    如果 topology 文件不存在，用 config.yaml 的模块信息 + 硬编码的常见边界模式做 fallback。
+    topology 文件由 bootstrap 阶段自动生成（多模块项目首次 review 时触发）。
+    文件不存在时返回空 dict，不做硬编码推断。
     """
     topo_path = os.path.join(project_root, "test-governance", "cross-module-topology.md")
 
     if os.path.exists(topo_path):
         return _parse_topology_from_file(topo_path)
 
-    # fallback：从 config.yaml 推断基本拓扑
-    logger.info("cross-module-topology.md 不存在，使用 fallback 拓扑推断")
-    return _infer_topology_fallback(project_root)
+    # 没有拓扑文件时返回空（bootstrap 阶段会自动生成，手动运行 evo-cli review 即可触发）
+    logger.info("cross-module-topology.md 不存在，跳过边界展开（下次 review 的 bootstrap 会自动生成）")
+    return {}
 
 
 def _parse_topology_from_file(topo_path):
@@ -159,19 +160,33 @@ def _parse_topology_from_file(topo_path):
     except Exception:
         return topology
 
-    # 提取文件路径引用（形如 `path/to/file.ext` 或 path/to/file.ext）
     import re
+
+    # 提取文件路径引用（从原始内容中提取，包括反引号内的路径）
     file_refs = re.findall(r'`([^`]+\.[a-zA-Z]{1,5})`', content)
     # 也匹配非反引号包裹的路径
     file_refs += re.findall(r'(?:^|\s)(\S+/\S+\.[a-zA-Z]{1,5})(?:\s|$|[,，。])', content, re.MULTILINE)
     file_refs = list(set(file_refs))
 
-    # 提取模块名对（形如 "模块A → 模块B" 或 "模块A ↔ 模块B"）
-    module_pairs = re.findall(r'(\w[\w-]+)\s*[→↔←]\s*(\w[\w-]+)', content)
+    # 剥离代码块（避免流程图箭头被误匹配为模块对）
+    content_no_code = re.sub(r'```[\s\S]*?```', '', content)
+    # 剥离反引号（使 "关键模块：`iOS-app` → `togo-agent`" 中的模块名可被匹配）
+    content_clean = content_no_code.replace('`', '')
 
-    # 将文件引用归属到模块对
-    # 这是 best-effort 解析，拓扑文件格式不固定
+    # 提取模块名对（形如 "模块A → 模块B" 或 "模块A ↔ 模块B"）
+    module_pairs = re.findall(r'(\w[\w-]+)\s*[→↔←]\s*(\w[\w-]+)', content_clean)
+
+    # 去重模块对（保留出现顺序）
+    seen_pairs = set()
+    unique_pairs = []
     for src_mod, dst_mod in module_pairs:
+        pair_key = tuple(sorted([src_mod, dst_mod]))
+        if pair_key not in seen_pairs:
+            seen_pairs.add(pair_key)
+            unique_pairs.append((src_mod, dst_mod))
+
+    # 初始化 topology 结构
+    for src_mod, dst_mod in unique_pairs:
         topology.setdefault(src_mod, {}).setdefault(dst_mod, {
             "shared_types": [],
             "counterparts": {},
@@ -182,6 +197,42 @@ def _parse_topology_from_file(topo_path):
             "counterparts": {},
             "protocols": [],
         })
+
+    # 将 file_refs 按路径前缀归属到模块，填充 shared_types 和 counterparts
+    # 收集所有出现在 topology 中的模块名
+    all_mod_names = set()
+    for src_mod, dst_mod in unique_pairs:
+        all_mod_names.add(src_mod)
+        all_mod_names.add(dst_mod)
+
+    # 按路径前缀将文件归属到模块（如 "togo-agent/src/types/index.ts" → "togo-agent"）
+    files_by_module = {}
+    for fref in file_refs:
+        for mod_name in all_mod_names:
+            # 前缀匹配：文件路径以 "模块名/" 开头
+            if fref.startswith(mod_name + "/"):
+                files_by_module.setdefault(mod_name, []).append(fref)
+                break
+
+    # 对每个模块对，双方的文件互为 shared_types / counterparts
+    for src_mod, dst_mod in unique_pairs:
+        src_files = files_by_module.get(src_mod, [])
+        dst_files = files_by_module.get(dst_mod, [])
+
+        if src_files or dst_files:
+            # src → dst 方向：src 的文件是 shared_types，dst 的文件是对端
+            for sf in src_files:
+                if sf not in topology[src_mod][dst_mod]["shared_types"]:
+                    topology[src_mod][dst_mod]["shared_types"].append(sf)
+                if dst_files:
+                    topology[src_mod][dst_mod]["counterparts"][sf] = dst_files
+
+            # dst → src 方向：对称
+            for df in dst_files:
+                if df not in topology[dst_mod][src_mod]["shared_types"]:
+                    topology[dst_mod][src_mod]["shared_types"].append(df)
+                if src_files:
+                    topology[dst_mod][src_mod]["counterparts"][df] = src_files
 
     # 检测通信协议关键词
     protocol_keywords = {
@@ -202,136 +253,6 @@ def _parse_topology_from_file(topo_path):
     return topology
 
 
-def _infer_topology_fallback(project_root):
-    """从已知的项目约定推断基本拓扑。
-
-    已知约定（来自 CLAUDE.md）：
-    - togo-agent 是中心节点，与 iOS-app/macos-app/voice-tunnel 通信
-    - togo-agent/src/types/index.ts 是跨端共享类型的权威来源
-    - iOS-app 的 Message.swift 需要和 types/index.ts 保持一致
-    """
-    topology = {}
-
-    # togo-agent 的类型文件是跨模块边界的核心
-    type_file = "togo-agent/src/types/index.ts"
-    type_file_path = os.path.join(project_root, type_file)
-
-    if not os.path.exists(type_file_path):
-        return topology
-
-    # togo-agent ↔ iOS-app 边界
-    ios_counterparts = _find_counterpart_files(
-        project_root, "iOS-app/", [".swift"],
-        keywords=["Message", "TaskStatus", "CLIType", "MessageType"],
-    )
-
-    # togo-agent ↔ macos-app 边界
-    mac_counterparts = _find_counterpart_files(
-        project_root, "macos-app/", [".swift"],
-        keywords=["Message", "ServerMessage", "ClientMessage"],
-    )
-
-    if ios_counterparts:
-        topology.setdefault("togo-agent", {})["iOS-app"] = {
-            "shared_types": [type_file],
-            "counterparts": {type_file: ios_counterparts},
-            "protocols": ["WebSocket"],
-        }
-        topology.setdefault("iOS-app", {})["togo-agent"] = {
-            "shared_types": ios_counterparts,
-            "counterparts": {cp: [type_file] for cp in ios_counterparts},
-            "protocols": ["WebSocket"],
-        }
-
-    if mac_counterparts:
-        topology.setdefault("togo-agent", {})["macos-app"] = {
-            "shared_types": [type_file],
-            "counterparts": {type_file: mac_counterparts},
-            "protocols": ["HTTP"],
-        }
-        topology.setdefault("macos-app", {})["togo-agent"] = {
-            "shared_types": mac_counterparts,
-            "counterparts": {cp: [type_file] for cp in mac_counterparts},
-            "protocols": ["HTTP"],
-        }
-
-    return topology
-
-
-def _find_counterpart_files(project_root, prefix, extensions, keywords):
-    """在指定目录前缀下找包含关键词的对端源文件（确定性搜索，不调 LLM）。
-
-    策略：
-    - 只搜索源文件，排除测试文件和构建产物
-    - 优先匹配文件名命中的（最可能是类型定义文件）
-    - 次优先匹配文件内容中有类型定义关键词的（struct/enum/class + keyword）
-    """
-    # 排除的目录名
-    SKIP_DIRS = {
-        "node_modules", ".build", "Build", "DerivedData",
-        "__pycache__", ".git", "Pods", "checkouts",
-    }
-    # 排除的路径段（测试目录）
-    SKIP_PATH_SEGMENTS = {"Tests", "Test", "__tests__", "test", "tests"}
-
-    name_matches = []   # 文件名匹配（高优先）
-    content_matches = []  # 内容匹配（低优先）
-
-    search_root = os.path.join(project_root, prefix)
-    if not os.path.isdir(search_root):
-        return []
-
-    for root, dirs, files in os.walk(search_root):
-        # 跳过构建产物、缓存、测试目录
-        dirs[:] = [
-            d for d in dirs
-            if d not in SKIP_DIRS and d not in SKIP_PATH_SEGMENTS
-        ]
-
-        rel_root = os.path.relpath(root, project_root)
-        # 双重检查：路径中不包含测试相关段
-        if any(seg in rel_root.split(os.sep) for seg in SKIP_PATH_SEGMENTS):
-            continue
-
-        for fname in files:
-            if not any(fname.endswith(ext) for ext in extensions):
-                continue
-            # 跳过测试文件名
-            if "Test" in fname and fname != fname.replace("Test", ""):
-                continue
-
-            filepath = os.path.join(root, fname)
-            rel_path = os.path.relpath(filepath, project_root)
-
-            # 优先级 1：文件名包含关键词
-            if any(kw.lower() in fname.lower() for kw in keywords):
-                name_matches.append(rel_path)
-                continue
-
-            # 优先级 2：文件内容前 30 行包含类型定义 + 关键词
-            try:
-                with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
-                    head_lines = [f.readline() for _ in range(30)]
-                head = "".join(head_lines)
-                # 要求同时有类型定义关键词（struct/enum/class/interface/type）和目标关键词
-                has_type_def = any(
-                    td in head for td in ["struct ", "enum ", "class ", "interface ", "type "]
-                )
-                has_keyword = any(kw in head for kw in keywords)
-                if has_type_def and has_keyword:
-                    content_matches.append(rel_path)
-            except Exception:
-                pass
-
-    # 文件名匹配优先，内容匹配补充，总数限制 10
-    results = name_matches[:10]
-    remaining = 10 - len(results)
-    if remaining > 0:
-        results.extend(content_matches[:remaining])
-
-    return results
-
-
 # ==================== 边界展开 ====================
 
 def _expand_boundaries(changed_by_module, topology, all_modules, project_root):
@@ -339,11 +260,11 @@ def _expand_boundaries(changed_by_module, topology, all_modules, project_root):
 
     返回 dict：
     {
-        "togo-agent": {
-            "boundary_files": ["togo-agent/src/types/index.ts"],
+        "module_name": {
+            "boundary_files": ["module_name/src/types/index.ts"],
             "counterpart_files": {
-                "togo-agent/src/types/index.ts": [
-                    "iOS-app/Packages/.../Message.swift"
+                "module_name/src/types/index.ts": [
+                    "peer_module/src/Message.swift"
                 ],
             },
             "protocols": ["WebSocket"],
@@ -404,15 +325,15 @@ def extract_all_boundaries(project_root):
     {
         "module_pairs": [
             {
-                "modules": ["togo-agent", "iOS-app"],
+                "modules": ["backend", "mobile-app"],
                 "protocols": ["WebSocket"],
                 "shared_files": {
-                    "togo-agent/src/types/index.ts": ["iOS-app/.../Message.swift"],
+                    "backend/src/types/index.ts": ["mobile-app/src/Message.swift"],
                 },
             },
             ...
         ],
-        "topology_summary": "togo-agent 是中心节点，...",
+        "topology_summary": "模块间通信：backend ↔ mobile-app（WebSocket）；...",
     }
     """
     topology = _parse_topology(project_root)
@@ -479,7 +400,7 @@ def _load_related_p0_cases(changed_files, project_root):
 
     返回 list[dict]：
     [
-        {"case_id": "PAIRING_KEY_NIL_CLEARS_LOCAL", "keyword": "geminiApiKey", "scope": "iOS-app/..."},
+        {"case_id": "CASE_ID", "keyword": "keyword", "scope": "module_dir/..."},
         ...
     ]
     """

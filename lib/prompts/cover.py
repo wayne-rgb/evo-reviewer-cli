@@ -22,44 +22,62 @@ ANALYZE_COVERAGE_PROMPT = """你是跨模块集成测试专家。请分析当前
 
 ## 分析方法
 
-### 第一步：构建覆盖矩阵
-列出所有模块边界对（如 websocket↔cli、http↔config、bot↔cli 等），
-对每个边界对检查 6 个测试维度的覆盖情况：
-1. **happy_path** — 正常业务流能走通
-2. **cleanup** — 连接断开/实例销毁后资源清理
-3. **concurrency** — 多设备/多请求并发操作
-4. **error_recovery** — 网络断开、API 失败、消息格式错误后的恢复
-5. **security_boundary** — 未认证访问、畸形消息、越权操作
-6. **fault_tolerance** — 重连后状态恢复、部分失败不影响整体
+**核心原则：追踪端到端业务链路，而非枚举模块边界对。**
 
-### 第二步：与 P0 场景交叉
+从用户操作出发，追踪数据流经过的完整模块链路。例如"用户发起 API 请求"这条链路是：
+`客户端 → API Gateway → service-handler → data-layer → DB`
+沿链路检查 6 个维度，而不是把 gateway↔service、service↔data-layer 拆开单独看。
+
+### 第一步：识别端到端业务链路
+从用户操作出发，追踪数据流经过的完整模块序列。每条链路应包含：
+- **链路名称**（如"用户创建订单链路"）
+- **节点序列**（如 客户端 → API Gateway → order-service → payment → DB）
+- 如果项目提供了 cross-module-topology.md，以其定义的链路为基础
+
+### 第二步：沿链路检查 6 维度覆盖
+对每条链路，追踪请求从头到尾的完整路径，检查 6 个维度：
+1. **happy_path** — 正常业务流能从链路起点走到终点
+2. **cleanup** — 链路中任意节点断开后，上下游资源都能清理
+3. **concurrency** — 多个请求同时走同一条链路
+4. **error_recovery** — 链路中某个节点失败后，整条链路的恢复行为
+5. **security_boundary** — 链路入口的认证/鉴权，链路中间节点的越权检查
+6. **fault_tolerance** — 链路部分中断后重连，状态能恢复
+
+### 第三步：与 P0 场景交叉
 检查每个 P0 场景是否在现有测试中被覆盖（包括边界状态）。
+每个 P0 场景应映射到至少一条业务链路。
 
-### 第三步：读源码确认
+### 第四步：读源码确认
 对于不确定是否覆盖的场景，Read 对应的源码和测试文件确认。
 特别关注：
 - 源码中的 catch/finally/error handler 是否被测试
 - 状态机的所有转换路径是否被测试
 - 广播消息是否在所有接收端被验证
+- 链路中间节点的错误是否正确传播到链路起点
 
-### 第四步：输出缺口清单
+### 第五步：输出缺口清单
 按优先级排序：
 - P0：P0 场景未覆盖或覆盖不完整
-- P1：模块边界对完全无测试
-- P2：已有测试但缺少重要维度（error_recovery、concurrency、fault_tolerance）
+- P1：整条链路完全无测试
+- P2：链路已有测试但缺少重要维度（error_recovery、concurrency、fault_tolerance）
 
 每个缺口必须包含：
-- 具体的用户场景描述（不是抽象的"测试并发"，而是"两个 iOS 设备同时修改同一个 CLI 配置"）
+- 所属的完整链路（module_chain）和具体断裂的段（gap_segment）
+- 具体的用户场景描述（不是抽象的"测试并发"，而是"两个客户端同时修改同一个资源的配置"）
 - 测试实现提示：用哪些 helper、mock 什么、断言什么
 - 相关源码文件路径
 
 ## 输出要求
 
 ### coverage_matrix（必须）
-输出完整的覆盖矩阵：列出所有识别到的模块边界对，每个边界对标注 6 个维度的覆盖状态（true/false）。
-这个矩阵应该反映你实际读代码确认的结果，不要猜测。
+按业务链路组织覆盖矩阵。每条记录包含：
+- `chain_name`：业务链路名称（如"用户创建订单链路"）
+- `module_chain`：完整节点序列（如 ["客户端", "API Gateway", "order-service", "payment", "DB"]）
+- `module_pair`：保留，用于兼容（可以是链路的关键边界对摘要）
+- `dimensions`：6 个维度的覆盖状态（true/false），基于实际读代码确认，不要猜测
 
 ### gaps（必须）
+- 每个缺口必须标注 `module_chain`（所属链路）和 `gap_segment`（断裂的具体段，如 "service-handler → data-layer"）
 - 不要报告已有测试已经覆盖的场景
 - 不要报告纯单元测试范畴的问题（那是 test-check 的职责）
 - 每个缺口的 scenario 必须足够具体，能直接据此写测试
@@ -67,7 +85,8 @@ ANALYZE_COVERAGE_PROMPT = """你是跨模块集成测试专家。请分析当前
 - 如果趋势数据显示某个 category 幻觉率高，优先为该 category 生成更精确的测试场景
 
 ### coverage_summary（必须）
-汇总统计：总边界对数、已覆盖数、现有测试文件数、各维度覆盖数。"""
+汇总统计：总边界对数、已覆盖数、现有测试文件数、各维度覆盖数。
+额外包含 `total_chains`（识别到的业务链路数）和 `fully_covered_chains`（所有维度都覆盖的链路数）。"""
 
 # Phase 2：为单个缺口生成集成测试
 GENERATE_TEST_PROMPT = """请为以下跨模块测试缺口编写集成测试。
@@ -75,6 +94,8 @@ GENERATE_TEST_PROMPT = """请为以下跨模块测试缺口编写集成测试。
 ## 缺口信息
 - ID: {gap_id}
 - 模块边界: {module_pair}
+- 业务链路: {module_chain}
+- 断裂段: {gap_segment}
 - 场景: {scenario}
 - 维度: {dimension}
 - 优先级: {priority}

@@ -339,9 +339,13 @@ def _generate_single_test(gap, wt, test_module, project_root, test_pattern, help
     gap_id = gap["id"]
     timeout = test_module.estimate_timeout(project_root, task="verify")
 
+    chain = gap.get("module_chain", [])
+    chain_str = " → ".join(chain) if chain else gap.get("module_pair", "")
     prompt = GENERATE_TEST_PROMPT.format(
         gap_id=gap_id,
         module_pair=gap.get("module_pair", ""),
+        module_chain=chain_str,
+        gap_segment=gap.get("gap_segment", ""),
         scenario=gap.get("scenario", ""),
         dimension=gap.get("dimension", ""),
         priority=gap.get("priority", ""),
@@ -450,7 +454,10 @@ def _merge_and_verify(project_root, modules):
 
 
 def _print_coverage_matrix(matrix, summary):
-    """打印覆盖矩阵。"""
+    """打印覆盖矩阵。
+
+    检测 chain_name 字段：有则按链路展示，无则走原有的边界对展示（兼容）。
+    """
     if not matrix:
         if summary:
             print(f"覆盖概况：{summary.get('existing_test_count', '?')} 个现有测试，"
@@ -462,22 +469,37 @@ def _print_coverage_matrix(matrix, summary):
                 ))
         return
 
-    # 打印矩阵表格
-    print("覆盖矩阵（已覆盖/未覆盖）：\n")
+    # 检测是否有链路信息
+    has_chains = any(row.get("chain_name") for row in matrix)
 
-    # 表头
     dim_short = ["正常", "清理", "并发", "错误", "安全", "容错"]
-    header = f"  {'模块边界对':<30s}  " + "  ".join(f"{d:>4s}" for d in dim_short)
-    print(header)
-    print("  " + "-" * (len(header) - 2))
 
-    for row in matrix:
-        pair = row.get("module_pair", "?")[:30]
-        cells = []
-        for dim in DIMENSIONS:
-            covered = row.get("dimensions", {}).get(dim, False)
-            cells.append("  ++" if covered else "  --")
-        print(f"  {pair:<30s}{''.join(cells)}")
+    if has_chains:
+        print("覆盖矩阵（按业务链路）：\n")
+        for row in matrix:
+            chain_name = row.get("chain_name", row.get("module_pair", "?"))
+            chain_nodes = row.get("module_chain", [])
+            dims = row.get("dimensions", {})
+            print(f"  {chain_name}")
+            if chain_nodes:
+                print(f"    链路: {' → '.join(chain_nodes)}")
+            print(f"    维度: " + "  ".join(
+                f"{d}={'++' if dims.get(dim, False) else '--'}"
+                for d, dim in zip(dim_short, DIMENSIONS)
+            ))
+    else:
+        # 兼容：无链路信息时按原有边界对展示
+        print("覆盖矩阵（已覆盖/未覆盖）：\n")
+        header = f"  {'模块边界对':<30s}  " + "  ".join(f"{d:>4s}" for d in dim_short)
+        print(header)
+        print("  " + "-" * (len(header) - 2))
+        for row in matrix:
+            pair = row.get("module_pair", "?")[:30]
+            cells = []
+            for dim in DIMENSIONS:
+                covered = row.get("dimensions", {}).get(dim, False)
+                cells.append("  ++" if covered else "  --")
+            print(f"  {pair:<30s}{''.join(cells)}")
 
     print()
     if summary:
@@ -486,10 +508,17 @@ def _print_coverage_matrix(matrix, summary):
         if total > 0:
             pct = covered * 100 // total
             print(f"  边界对覆盖率：{covered}/{total}（{pct}%）")
+        total_chains = summary.get("total_chains")
+        fully_covered = summary.get("fully_covered_chains")
+        if total_chains is not None:
+            print(f"  链路覆盖率：{fully_covered or 0}/{total_chains} 条链路全维度覆盖")
 
 
 def _print_gap_plan(gaps):
-    """打印排序后的缺口计划。"""
+    """打印排序后的缺口计划。
+
+    有 module_chain 时展示链路和断裂段，无则走原有展示（兼容）。
+    """
     by_priority = {"P0": [], "P1": [], "P2": []}
     for g in gaps:
         by_priority.get(g.get("priority", "P2"), by_priority["P2"]).append(g)
@@ -501,7 +530,14 @@ def _print_gap_plan(gaps):
         print(f"\n{pri}（{len(items)} 个）：")
         for g in items:
             dim_label = DIMENSION_LABELS.get(g.get("dimension", ""), g.get("dimension", ""))
-            print(f"  [{g['id']}] {g['module_pair']} | {dim_label}")
+            chain = g.get("module_chain")
+            segment = g.get("gap_segment")
+            if chain:
+                print(f"  [{g['id']}] {' → '.join(chain)} | {dim_label}")
+                if segment:
+                    print(f"         断裂段: {segment}")
+            else:
+                print(f"  [{g['id']}] {g.get('module_pair', '?')} | {dim_label}")
             print(f"         {g['scenario']}")
 
 
@@ -810,13 +846,13 @@ def _find_cross_test_module(project_root, modules):
 
 
 def _read_test_pattern(project_root, modules):
-    """读一个现有集成测试文件作为模式参考。
+    """读取现有集成测试文件作为模式参考。
 
-    按文件大小选择（跳过太短或太长的），不硬编码文件名。
+    选 2 个文件（最大 + 中等大小），总 token 预算 4000 字符（2500+1500）。
+    跳过太短或太长的文件，不硬编码文件名。
     """
     test_dirs = _find_integration_test_dirs(project_root, modules)
-    best = None
-    best_size = 0
+    candidates = []
 
     for td in test_dirs:
         try:
@@ -827,19 +863,39 @@ def _read_test_pattern(project_root, modules):
                 if not _is_test_file(f):
                     continue
                 size = os.path.getsize(fpath)
-                if 1000 < size < 20000 and size > best_size:
-                    best = fpath
-                    best_size = size
+                if 1000 < size < 20000:
+                    candidates.append((fpath, size))
         except Exception:
             continue
 
-    if best:
+    if not candidates:
+        return ""
+
+    # 按大小降序排列
+    candidates.sort(key=lambda x: -x[1])
+
+    parts = []
+    # 最大的文件：2500 字符预算
+    try:
+        with open(candidates[0][0], "r", encoding="utf-8") as fh:
+            rel = os.path.relpath(candidates[0][0], project_root)
+            parts.append(f"### {rel}\n{fh.read()[:2500]}")
+    except Exception:
+        pass
+
+    # 中等大小的文件：1500 字符预算（选中间位置的文件）
+    if len(candidates) >= 2:
+        mid_idx = len(candidates) // 2
+        if mid_idx == 0:
+            mid_idx = 1
         try:
-            with open(best, "r", encoding="utf-8") as fh:
-                return fh.read()[:4000]
+            with open(candidates[mid_idx][0], "r", encoding="utf-8") as fh:
+                rel = os.path.relpath(candidates[mid_idx][0], project_root)
+                parts.append(f"### {rel}\n{fh.read()[:1500]}")
         except Exception:
             pass
-    return ""
+
+    return "\n\n".join(parts)
 
 
 def _find_new_test_file(wt_path, gap_id, language):

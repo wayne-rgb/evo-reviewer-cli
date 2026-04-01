@@ -34,39 +34,32 @@ def run_bootstrap(state, project_root):
             missing.append(name)
             needs_bootstrap = True
 
-    if not needs_bootstrap:
+    if needs_bootstrap:
+        logger.info(f"需要初始化：{missing}")
+
+        os.makedirs(tg_dir, exist_ok=True)
+        os.makedirs(scripts_dir, exist_ok=True)
+
+        # 生成缺失文件
+        if "config.yaml" in missing:
+            _generate_config(project_root)
+
+        if "gate.sh" in missing:
+            _copy_gate_template(project_root)
+
+        for md_file in ["infrastructure.md", "coding-guidelines.md", "dimension-coverage.yaml"]:
+            if md_file in missing:
+                _create_skeleton(os.path.join(tg_dir, md_file), md_file)
+
+        # 检查 .gitignore
+        _ensure_gitignore(project_root)
+
+        logger.info("Bootstrap 完成")
+    else:
         logger.info("test-governance 已完整，跳过 bootstrap")
-        return
 
-    logger.info(f"需要初始化：{missing}")
-
-    os.makedirs(tg_dir, exist_ok=True)
-    os.makedirs(scripts_dir, exist_ok=True)
-
-    # 生成缺失文件
-    if "config.yaml" in missing:
-        _generate_config(project_root)
-
-    if "gate.sh" in missing:
-        _copy_gate_template(project_root)
-
-    for md_file in ["infrastructure.md", "coding-guidelines.md", "dimension-coverage.yaml"]:
-        if md_file in missing:
-            _create_skeleton(os.path.join(tg_dir, md_file), md_file)
-
-    # 检查 .gitignore
-    _ensure_gitignore(project_root)
-
-    # 跨模块拓扑扫描（多模块时）
-    from lib.config import get_modules
-    try:
-        modules = get_modules(project_root)
-        if len(modules) > 1:
-            _scan_cross_module_topology(project_root, modules)
-    except Exception as e:
-        logger.warning(f"跨模块拓扑扫描跳过: {e}")
-
-    logger.info("Bootstrap 完成")
+    # 拓扑文件独立检查（不受 needs_bootstrap 门控，review/deep 每次都确保存在）
+    _ensure_topology(project_root)
 
 
 def _generate_config(project_root):
@@ -145,6 +138,24 @@ def _ensure_gitignore(project_root):
     else:
         with open(gitignore, 'w') as f:
             f.write(f"# evo-review\n{pattern}\n.evo-review/\n")
+
+
+def _ensure_topology(project_root):
+    """确保跨模块拓扑文件存在。多模块项目缺失时自动生成。"""
+    topo_path = os.path.join(project_root, "test-governance", "cross-module-topology.md")
+    if os.path.exists(topo_path):
+        return
+
+    from lib.config import get_modules
+    try:
+        modules = get_modules(project_root)
+        if len(modules) > 1:
+            logger.info("跨模块拓扑文件缺失，自动生成...")
+            _scan_cross_module_topology(project_root, modules)
+        else:
+            logger.debug("单模块项目，跳过拓扑扫描")
+    except Exception as e:
+        logger.warning(f"跨模块拓扑扫描跳过: {e}")
 
 
 def _scan_cross_module_topology(project_root, modules):

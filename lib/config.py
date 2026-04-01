@@ -212,13 +212,17 @@ def load_config(project_root: str) -> dict:
     """
     读取 test-governance/config.yaml，返回解析后的 dict。
 
+    支持 EVO_CONFIG 环境变量覆盖默认路径，方便非标准目录结构的项目使用。
+
     参数:
         project_root: 项目根目录
 
     返回:
         解析后的配置字典
     """
-    config_path = os.path.join(project_root, "test-governance", "config.yaml")
+    config_path = os.environ.get("EVO_CONFIG") or os.path.join(
+        project_root, "test-governance", "config.yaml"
+    )
     if not os.path.isfile(config_path):
         raise FileNotFoundError(f"配置文件不存在: {config_path}")
 
