@@ -316,6 +316,10 @@ def _generate_tests(project_root, modules, gaps):
         has_ok = any(r["status"] == "ok" for r in results.values())
         if has_ok:
             commit_in_worktree(wt, "evo-cover: 新增跨模块集成测试")
+        else:
+            # 所有缺口都失败，清理 worktree 避免资源泄漏
+            remove_worktree(wt.path, project_root)
+            logger.info("所有缺口生成失败，已清理 worktree")
     except Exception as e:
         logger.error("Phase 4 异常，清理 worktree: %s", e)
         remove_worktree(wt.path, project_root)
