@@ -184,22 +184,39 @@ def _prioritize_gaps(gaps, project_root):
         "happy_path": 5,
     }
 
-    # 从 trend 读取弱项 category（幻觉率高的排前面）
-    weak_categories = _get_weak_categories(project_root)
+    # 从 trend 读取弱项 dimension（将 review category 映射到测试 dimension）
+    weak_dimensions = _get_weak_dimensions(project_root)
 
     def sort_key(gap):
         p = priority_order.get(gap.get("priority", "P2"), 2)
-        # 弱项 category boost（在 weak_categories 中的排前面）
-        cat_boost = 0 if gap.get("module_pair", "") in weak_categories else 1
-        d = dimension_order.get(gap.get("dimension", "happy_path"), 5)
-        return (p, cat_boost, d)
+        # 弱项 dimension boost（trend 数据中幻觉率高的 category 对应的维度排前面）
+        dim = gap.get("dimension", "happy_path")
+        dim_boost = 0 if dim in weak_dimensions else 1
+        d = dimension_order.get(dim, 5)
+        return (p, dim_boost, d)
 
     gaps.sort(key=sort_key)
     return gaps
 
 
-def _get_weak_categories(project_root):
-    """从 history.jsonl 读取弱项（幻觉率 > 50% 的 category）。"""
+def _get_weak_dimensions(project_root):
+    """从 history.jsonl 读取弱项，将 review category 映射到测试 dimension。
+
+    review 的 category（如 error_swallow, concurrency）和 cover 的 dimension
+    （如 error_recovery, concurrency）不是同一套术语。需要映射。
+    """
+    # review category → cover dimension 的映射
+    _CATEGORY_TO_DIMENSION = {
+        "error_swallow": "error_recovery",
+        "error_propagation": "error_recovery",
+        "concurrency": "concurrency",
+        "resource_leak": "cleanup",
+        "flag_lock": "concurrency",
+        "security_boundary": "security_boundary",
+        "state_machine": "fault_tolerance",
+        "implicit_assumption": "error_recovery",
+    }
+
     try:
         from lib.steps.history import load_history
         entries = load_history(project_root)
@@ -208,17 +225,19 @@ def _get_weak_categories(project_root):
 
         from collections import defaultdict
         cat_stats = defaultdict(lambda: {"verified": 0, "hallucination": 0})
-        for e in entries[-20:]:  # 最近 20 次
+        for e in entries[-20:]:
             for cat, stats in e.get("by_category", {}).items():
                 cat_stats[cat]["verified"] += stats.get("verified", 0)
                 cat_stats[cat]["hallucination"] += stats.get("hallucination", 0)
 
-        weak = set()
+        weak_dims = set()
         for cat, stats in cat_stats.items():
             total = stats["verified"] + stats["hallucination"]
             if total >= 3 and stats["hallucination"] / total > 0.5:
-                weak.add(cat)
-        return weak
+                dim = _CATEGORY_TO_DIMENSION.get(cat)
+                if dim:
+                    weak_dims.add(dim)
+        return weak_dims
     except Exception:
         return set()
 
@@ -248,12 +267,15 @@ def _confirm_plan(gaps):
 # ==================== Phase 4: 测试生成 ====================
 
 def _generate_tests(project_root, modules, gaps):
-    """Phase 4：为每个缺口生成测试（并行）。"""
-    from lib.worktree import create_worktree, commit_in_worktree
+    """Phase 4：为每个缺口生成测试（并行）。
+
+    在 worktree 中工作，确保异常时 worktree 被清理。
+    """
+    from lib.worktree import create_worktree, commit_in_worktree, remove_worktree
 
     test_module = _find_cross_test_module(project_root, modules)
     if not test_module:
-        logger.error("未找到跨模块测试目录")
+        logger.error("未找到有 cross_command 或 test_dir 的模块，无法确定测试位置")
         return {}
 
     wt = create_worktree("cover", project_root)
@@ -264,35 +286,40 @@ def _generate_tests(project_root, modules, gaps):
 
     results = {}
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {}
-        for gap in gaps:
-            future = pool.submit(
-                _generate_single_test,
-                gap, wt, test_module, project_root,
-                test_pattern, helpers_available,
-            )
-            futures[future] = gap["id"]
+    try:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            futures = {}
+            for gap in gaps:
+                future = pool.submit(
+                    _generate_single_test,
+                    gap, wt, test_module, project_root,
+                    test_pattern, helpers_available,
+                )
+                futures[future] = gap["id"]
 
-        for future in as_completed(futures):
-            gap_id = futures[future]
-            try:
-                result = future.result()
-                with _lock:
-                    results[gap_id] = result
-                status = result["status"]
-                if status == "ok":
-                    print(f"  [{gap_id}] 生成成功")
-                else:
-                    print(f"  [{gap_id}] {status}: {result.get('reason', '')[:80]}")
-            except Exception as e:
-                logger.error("[%s] 异常: %s", gap_id, e)
-                with _lock:
-                    results[gap_id] = {"status": "failed", "reason": str(e)}
+            for future in as_completed(futures):
+                gap_id = futures[future]
+                try:
+                    result = future.result()
+                    with _lock:
+                        results[gap_id] = result
+                    status = result["status"]
+                    if status == "ok":
+                        print(f"  [{gap_id}] 生成成功")
+                    else:
+                        print(f"  [{gap_id}] {status}: {result.get('reason', '')[:80]}")
+                except Exception as e:
+                    logger.error("[%s] 异常: %s", gap_id, e)
+                    with _lock:
+                        results[gap_id] = {"status": "failed", "reason": str(e)}
 
-    has_ok = any(r["status"] == "ok" for r in results.values())
-    if has_ok:
-        commit_in_worktree(wt, "evo-cover: 新增跨模块集成测试")
+        has_ok = any(r["status"] == "ok" for r in results.values())
+        if has_ok:
+            commit_in_worktree(wt, "evo-cover: 新增跨模块集成测试")
+    except Exception as e:
+        logger.error("Phase 4 异常，清理 worktree: %s", e)
+        remove_worktree(wt.path, project_root)
+        raise
 
     return results
 
@@ -363,11 +390,14 @@ def _generate_single_test(gap, wt, test_module, project_root, test_pattern, help
     if retry_result["exit_code"] == 0:
         return {"status": "ok", "test_file": test_file}
 
-    # 删除失败的测试文件
-    abs_path = os.path.join(wt.path, test_file)
-    if os.path.exists(abs_path):
-        os.remove(abs_path)
-        logger.info("[%s] 已删除失败的测试文件: %s", gap_id, test_file)
+    # 删除失败的测试文件，避免合并坏测试
+    try:
+        abs_path = os.path.join(wt.path, test_file)
+        if os.path.exists(abs_path):
+            os.remove(abs_path)
+            logger.info("[%s] 已删除失败的测试文件: %s", gap_id, test_file)
+    except OSError as e:
+        logger.warning("[%s] 删除测试文件失败（非关键）: %s", gap_id, e)
 
     return {"status": "failed", "reason": "修复后测试仍失败", "test_file": test_file}
 
