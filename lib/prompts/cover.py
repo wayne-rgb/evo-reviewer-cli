@@ -87,17 +87,17 @@ GENERATE_TEST_PROMPT = """请为以下跨模块测试缺口编写集成测试。
 {helpers_available}
 
 ## 要求
-1. 测试文件放在项目的跨模块测试目录（参考现有 cross-module-*.test.ts 的位置）
-2. 文件名格式：cross-module-cover-{gap_id_lower}.test.ts
-3. 遵循现有测试模式：
-   - 使用 createTestApp() 创建隔离测试实例
-   - 使用 createAuthenticatedClient() 创建已认证 WS 客户端
-   - afterEach 中清理所有连接和资源
+1. 测试文件放在项目现有的集成测试目录中（参考上面的"现有测试模式参考"确定位置）
+2. 文件名要能体现测试场景，避免与现有文件重名
+3. **严格遵循现有测试模式**：
+   - 先 Read 上面列出的"现有测试模式参考"文件，理解项目的测试写法
+   - 复用项目已有的 helper 函数（参考"可用的测试 Helper"列表）
+   - 遵循项目的 setup/teardown 惯例（如 afterEach 中清理资源）
 4. 测试必须是**绿灯测试**（验证当前代码行为正确）
 5. 充分覆盖边界状态：不只是 happy path，还要测错误输入、超时、并发
-6. 使用 describe/it 结构，测试名称清晰描述场景
-7. 如果场景涉及故障注入，使用 createFailAfterNMock 等 helper
-8. 如果场景涉及广播验证，使用 assertBroadcastToAll 等 helper
+6. 测试名称清晰描述场景
+7. 如果 helper 列表中有故障注入工具，优先使用
+8. 如果 helper 列表中有广播/消息断言工具，优先使用
 
 请先 Read 相关源码和已有测试文件理解上下文，然后编写测试。"""
 

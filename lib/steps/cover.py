@@ -126,8 +126,8 @@ def _analyze_coverage(project_root, modules):
     )
     topology_summary = _read_topology(project_root)
     p0_cases = _read_p0_cases(project_root)
-    existing_tests = _extract_existing_tests(project_root)
-    helpers_summary = _extract_helpers(project_root)
+    existing_tests = _extract_existing_tests(project_root, modules)
+    helpers_summary = _extract_helpers(project_root, modules)
     trend_weaknesses = _read_trend_weaknesses(project_root)
 
     prompt = ANALYZE_COVERAGE_PROMPT.format(
@@ -259,8 +259,8 @@ def _generate_tests(project_root, modules, gaps):
     wt = create_worktree("cover", project_root)
     logger.info("worktree 已创建：%s", wt.path)
 
-    test_pattern = _read_test_pattern(project_root, test_module)
-    helpers_available = _extract_helpers(project_root)
+    test_pattern = _read_test_pattern(project_root, modules)
+    helpers_available = _extract_helpers(project_root, modules)
 
     results = {}
 
@@ -331,7 +331,7 @@ def _generate_single_test(gap, wt, test_module, project_root, test_pattern, help
     except Exception as e:
         return {"status": "failed", "reason": f"生成失败: {e}"}
 
-    test_file = _find_new_test_file(wt.path, gap_id, test_module)
+    test_file = _find_new_test_file(wt.path, gap_id, test_module.language)
     if not test_file:
         return {"status": "failed", "reason": "未找到生成的测试文件"}
 
@@ -552,18 +552,41 @@ def _read_trend_weaknesses(project_root):
         return ""
 
 
-def _extract_existing_tests(project_root):
-    """提取现有跨模块测试的 describe/it 描述（轻量，不读实现）。"""
-    test_dirs = _find_cross_test_dirs(project_root)
+def _extract_existing_tests(project_root, modules):
+    """提取现有集成测试的场景描述（轻量，不读实现）。
+
+    按语言选择 grep 模式：
+    - TypeScript/JS：提取 describe()/it() 行
+    - Go：提取 func Test* 行
+    - Python：提取 def test_* 和 class Test* 行
+    - Swift：提取 func test* 行
+    """
+    test_dirs = _find_integration_test_dirs(project_root, modules)
     if not test_dirs:
         return ""
+
+    # 根据项目语言构造 grep 模式
+    languages = {m.language for m in modules}
+    patterns = []
+    if languages & {"typescript", "javascript"}:
+        patterns.append(r"(describe|it|test)\(")
+    if "go" in languages:
+        patterns.append(r"^func Test")
+    if "python" in languages:
+        patterns.append(r"(def test_|class Test)")
+    if "swift" in languages:
+        patterns.append(r"func test")
+
+    if not patterns:
+        patterns = [r"(describe|it|test)\(", r"^func Test", r"def test_"]
+
+    grep_pattern = "|".join(patterns)
 
     lines = []
     for test_dir in test_dirs:
         try:
             result = subprocess.run(
-                ["grep", "-rn", "-E", r"(describe|it)\(", test_dir,
-                 "--include=*cross-module*", "--include=*cross-operation*"],
+                ["grep", "-rn", "-E", grep_pattern, test_dir],
                 capture_output=True, text=True, timeout=15,
             )
             if result.stdout:
@@ -583,27 +606,49 @@ def _extract_existing_tests(project_root):
     return "\n".join(lines) if lines else ""
 
 
-def _extract_helpers(project_root):
-    """提取测试 helper 的函数签名摘要。"""
-    helper_dirs = _find_helper_dirs(project_root)
+def _extract_helpers(project_root, modules):
+    """提取测试 helper 的函数签名摘要。
+
+    按语言选择 grep 模式，不硬编码 TypeScript。
+    """
+    helper_dirs = _find_helper_dirs(project_root, modules)
     if not helper_dirs:
         return ""
+
+    languages = {m.language for m in modules}
+    # 按语言构造导出函数的 grep 模式
+    patterns = []
+    if languages & {"typescript", "javascript"}:
+        patterns.append(r"^export (async )?function |^export const \w+ =")
+    if "go" in languages:
+        patterns.append(r"^func [A-Z]")  # Go 导出函数以大写开头
+    if "python" in languages:
+        patterns.append(r"^def [a-z]")
+    if "swift" in languages:
+        patterns.append(r"^(public |open )?func ")
+
+    if not patterns:
+        patterns = [r"^export (async )?function |^func [A-Z]|^def [a-z]"]
+
+    grep_pattern = "|".join(patterns)
+
+    # 常见源码扩展名
+    source_exts = {".ts", ".js", ".go", ".py", ".swift"}
 
     lines = []
     for hdir in helper_dirs:
         if not os.path.isdir(hdir):
             continue
         for fname in sorted(os.listdir(hdir)):
-            if not fname.endswith((".ts", ".js")):
+            ext = os.path.splitext(fname)[1]
+            if ext not in source_exts:
                 continue
             fpath = os.path.join(hdir, fname)
             rel = os.path.relpath(fpath, project_root)
             lines.append(f"\n### {rel}")
             try:
                 result = subprocess.run(
-                    ["grep", "-n", "-E",
-                     r"^export (async )?function |^export const \w+ =",
-                     fpath],
+                    ["grep", "-n", "-E", grep_pattern, fpath],
                     capture_output=True, text=True, timeout=5,
                 )
                 if result.stdout:
@@ -617,31 +662,106 @@ def _extract_helpers(project_root):
 
 # ==================== 文件查找函数 ====================
 
-def _find_cross_test_dirs(project_root):
-    """查找包含跨模块测试文件的目录。"""
-    dirs = []
-    for root, dirnames, files in os.walk(project_root):
-        dirnames[:] = [d for d in dirnames if d not in (
-            "node_modules", ".git", ".evo-review", "dist", "build",
-            ".build", "DerivedData", "vendor",
-        )]
-        for f in files:
-            if "cross-module" in f and f.endswith((".test.ts", ".test.js")):
-                dirs.append(root)
-                break
-    return dirs
+# 各语言的测试文件后缀
+_TEST_SUFFIXES = {
+    "typescript": (".test.ts", ".test.js", ".spec.ts", ".spec.js"),
+    "javascript": (".test.js", ".spec.js"),
+    "go": ("_test.go",),
+    "python": (".py",),  # Python 用前缀 test_ 判断
+    "swift": ("Tests.swift", "Test.swift"),
+}
+
+# 各语言的单文件测试命令模板
+_SINGLE_TEST_CMD = {
+    "typescript": "npx vitest run {test_file}",
+    "javascript": "npx vitest run {test_file}",
+    "go": "go test -race -run . ./{test_pkg}/",
+    "python": "python -m pytest {test_file} -v",
+    "swift": None,  # Swift 通过 xcodebuild，需要特殊处理
+}
 
 
-def _find_helper_dirs(project_root):
-    """查找测试 helper 目录。"""
-    dirs = []
-    for root, dirnames, files in os.walk(project_root):
-        dirnames[:] = [d for d in dirnames if d not in (
-            "node_modules", ".git", ".evo-review", "dist", "build",
-        )]
-        if os.path.basename(root) == "helpers" and "__tests__" in root:
-            dirs.append(root)
-    return dirs
+def _is_test_file(filename, language=None):
+    """判断文件是否是测试文件。
+
+    如果指定了 language 按该语言判断，否则按所有语言尝试。
+    """
+    basename = os.path.basename(filename)
+
+    if language:
+        langs = [language]
+    else:
+        langs = list(_TEST_SUFFIXES.keys())
+
+    for lang in langs:
+        suffixes = _TEST_SUFFIXES.get(lang, ())
+        if lang == "python":
+            if basename.startswith("test_") and basename.endswith(".py"):
+                return True
+            if basename.endswith("_test.py"):
+                return True
+        else:
+            for suffix in suffixes:
+                if filename.endswith(suffix):
+                    return True
+    return False
+
+
+def _find_integration_test_dirs(project_root, modules):
+    """查找集成测试目录。
+
+    优先从 config.yaml 的 test_dir 获取，fallback 到自动扫描。
+    """
+    dirs = set()
+
+    # 策略 1：从模块配置获取 test_dir
+    for m in modules:
+        if m.test_dir:
+            test_path = os.path.join(project_root, m.test_dir)
+            if os.path.isdir(test_path):
+                dirs.add(test_path)
+                for subdir in ("integration", "cross", "e2e", "cross-module"):
+                    sub_path = os.path.join(test_path, subdir)
+                    if os.path.isdir(sub_path):
+                        dirs.add(sub_path)
+
+    # 策略 2：fallback 扫描
+    if not dirs:
+        _SKIP = {"node_modules", ".git", ".evo-review", "dist", "build",
+                 ".build", "DerivedData", "vendor", "__pycache__"}
+        for root, dirnames, files in os.walk(project_root):
+            dirnames[:] = [d for d in dirnames if d not in _SKIP]
+            basename = os.path.basename(root)
+            if basename in ("integration", "cross", "e2e", "__tests__", "tests", "test"):
+                dirs.add(root)
+
+    return list(dirs)
+
+
+def _find_helper_dirs(project_root, modules):
+    """查找测试 helper 目录。
+
+    从模块配置的 helper_dir 获取，fallback 到自动扫描。
+    """
+    dirs = set()
+
+    for m in modules:
+        if hasattr(m, "helper_dir") and m.helper_dir:
+            helper_path = os.path.join(project_root, m.helper_dir)
+            if os.path.isdir(helper_path):
+                dirs.add(helper_path)
+
+    if not dirs:
+        _SKIP = {"node_modules", ".git", ".evo-review", "dist", "build",
+                 ".build", "DerivedData", "vendor"}
+        for root, dirnames, files in os.walk(project_root):
+            dirnames[:] = [d for d in dirnames if d not in _SKIP]
+            if os.path.basename(root) == "helpers":
+                parent = os.path.basename(os.path.dirname(root))
+                if parent in ("__tests__", "tests", "test", "integration", "e2e"):
+                    dirs.add(root)
+
+    return list(dirs)
 
 
 def _find_cross_test_module(project_root, modules):
@@ -655,53 +775,77 @@ def _find_cross_test_module(project_root, modules):
     return modules[0] if modules else None
 
 
-def _read_test_pattern(project_root, test_module):
-    """读一个现有跨模块测试文件作为模式参考。"""
-    test_dirs = _find_cross_test_dirs(project_root)
+def _read_test_pattern(project_root, modules):
+    """读一个现有集成测试文件作为模式参考。
+
+    按文件大小选择（跳过太短或太长的），不硬编码文件名。
+    """
+    test_dirs = _find_integration_test_dirs(project_root, modules)
+    best = None
+    best_size = 0
+
     for td in test_dirs:
-        for f in sorted(os.listdir(td)):
-            if "cross-module" in f and f.endswith(".test.ts"):
+        try:
+            for f in sorted(os.listdir(td)):
                 fpath = os.path.join(td, f)
-                try:
-                    with open(fpath, "r", encoding="utf-8") as fh:
-                        content = fh.read()
-                    if len(content) > 500:
-                        return content[:4000]
-                except Exception:
+                if not os.path.isfile(fpath):
                     continue
+                if not _is_test_file(f):
+                    continue
+                size = os.path.getsize(fpath)
+                if 1000 < size < 20000 and size > best_size:
+                    best = fpath
+                    best_size = size
+        except Exception:
+            continue
+
+    if best:
+        try:
+            with open(best, "r", encoding="utf-8") as fh:
+                return fh.read()[:4000]
+        except Exception:
+            pass
     return ""
 
 
-def _find_new_test_file(wt_path, gap_id, test_module):
+def _find_new_test_file(wt_path, gap_id, language):
     """在 worktree 中查找新生成的测试文件。"""
     gap_lower = gap_id.lower()
+
     result = subprocess.run(
         ["git", "ls-files", "--others", "--exclude-standard"],
         cwd=wt_path, capture_output=True, text=True,
     )
     new_files = [f for f in result.stdout.strip().split("\n") if f]
 
+    # 优先找包含 gap_id 或 cover 的测试文件
     for f in new_files:
-        if f.endswith((".test.ts", ".test.js")) and ("cover" in f or gap_lower in f.lower()):
+        if _is_test_file(f, language) and ("cover" in f.lower() or gap_lower in f.lower()):
             return f
 
+    # fallback：任何新的测试文件
     for f in new_files:
-        if f.endswith((".test.ts", ".test.js")) and "cross-module" in f:
+        if _is_test_file(f, language):
             return f
 
+    # 策略 2：修改的文件
     result = subprocess.run(
         ["git", "diff", "--name-only"],
         cwd=wt_path, capture_output=True, text=True,
     )
     for f in result.stdout.strip().split("\n"):
-        if f and f.endswith((".test.ts", ".test.js")) and "cross-module" in f:
+        if f and _is_test_file(f, language):
             return f
 
     return None
 
 
 def _run_single_test(wt_path, test_file, module):
-    """在 worktree 中运行单个测试文件。"""
+    """在 worktree 中运行单个测试文件。
+
+    根据模块语言选择测试命令，不硬编码特定框架。
+    """
+    language = getattr(module, "language", "")
     mod_dir = wt_path
     if module.src_dir:
         mod_root = module.src_dir.rstrip("/").split("/")[0]
@@ -709,7 +853,19 @@ def _run_single_test(wt_path, test_file, module):
         if os.path.isdir(candidate):
             mod_dir = candidate
 
-    cmd = f"npx vitest run {test_file}"
+    # 构造单文件测试命令
+    cmd_template = _SINGLE_TEST_CMD.get(language)
+    if not cmd_template:
+        if module.unit_command:
+            cmd = module.unit_command
+        else:
+            return {"exit_code": 1, "output": f"不支持语言 {language} 的单文件测试"}
+    elif language == "go":
+        test_pkg = os.path.dirname(test_file) or "."
+        cmd = cmd_template.format(test_file=test_file, test_pkg=test_pkg)
+    else:
+        cmd = cmd_template.format(test_file=test_file)
+
     logger.info("运行测试: cd %s && %s", mod_dir, cmd)
 
     try:
