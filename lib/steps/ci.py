@@ -34,9 +34,8 @@ def run_ci(project_root, auto_fix=False, pending_file=None, diff_base=None):
     from lib.git import git_diff_files, files_to_modules
     from lib.config import get_modules
 
-    n = 1 if diff_base is None else None
-    if n is not None:
-        changed = git_diff_files(n=n, cwd=project_root)
+    if diff_base is None:
+        changed = git_diff_files(n=1, cwd=project_root)
     else:
         changed = _diff_files_from_base(diff_base, project_root)
 
@@ -58,7 +57,7 @@ def run_ci(project_root, auto_fix=False, pending_file=None, diff_base=None):
     all_modules = get_modules(project_root)
     module_files = files_to_modules(changed, all_modules)
     modules_by_name = {m.name: m for m in all_modules}
-    affected = [modules_by_name[n] for n in module_files if n in modules_by_name]
+    affected = [modules_by_name[mod_name] for mod_name in module_files if mod_name in modules_by_name]
 
     if not affected:
         print("改动文件未匹配到已知模块，只跑 preflight")
@@ -67,14 +66,23 @@ def run_ci(project_root, auto_fix=False, pending_file=None, diff_base=None):
 
     print(f"受影响模块：{', '.join(m.name for m in affected)}")
 
-    # === 阶段 1：静态检查（lint + typecheck）===
-    # 静态检查失败也走 auto_fix（lint/type 错误 AI 可以修）
-    static_ok = _run_static_checks(affected, project_root)
+    # === 阶段 1：preflight ===
+    preflight_ok = _run_cmd(
+        "bash scripts/test-governance-gate.sh preflight", project_root,
+    )
 
-    # === 阶段 2：测试 ===
+    # === 阶段 2：静态检查 + 测试（一次跑完，带 capture）===
+    static_failures = _collect_static_failures(affected, project_root)
     test_failures = _run_all_tests(affected, project_root)
 
-    all_ok = static_ok and not test_failures
+    # 显示各项结果
+    for f in static_failures:
+        print(f"  失败: [{f['module']}] {f['command']}")
+    for f in test_failures:
+        print(f"  失败: [{f['module']}] {f['command']}")
+
+    all_failures = static_failures + test_failures
+    all_ok = preflight_ok and not all_failures
 
     if all_ok:
         print("\nCI 全部通过")
@@ -84,20 +92,31 @@ def run_ci(project_root, auto_fix=False, pending_file=None, diff_base=None):
         print("\nCI 有失败项")
         return False
 
+    # preflight 失败不能靠 AI 修（治理门禁问题），直接写入 pending
+    pending_from_preflight = []
+    if not preflight_ok:
+        pending_from_preflight.append({
+            "type": "preflight",
+            "module": "_governance",
+            "command": "bash scripts/test-governance-gate.sh preflight",
+            "output": "治理门禁失败，需要人工检查",
+            "reason": "preflight 治理门禁失败，非代码问题，无法自动修复",
+        })
+
     # === 阶段 3：auto_fix 修复循环 ===
     print(f"\n{'='*60}")
     print("CI 有失败项，进入 auto_fix 修复循环")
     print(f"{'='*60}")
 
-    # 收集所有失败（静态 + 测试）
-    all_failures = []
-    if not static_ok:
-        all_failures.extend(_collect_static_failures(affected, project_root))
-    all_failures.extend(test_failures)
+    if all_failures:
+        pending_items = _fix_loop(
+            project_root, affected, all_failures, modules_by_name,
+        )
+    else:
+        pending_items = []
 
-    pending_items = _fix_loop(
-        project_root, affected, all_failures, modules_by_name,
-    )
+    # 合入 preflight pending
+    pending_items = pending_from_preflight + pending_items
 
     # 写入 pending 文件
     if pending_items and pending_file:
@@ -113,22 +132,6 @@ def run_ci(project_root, auto_fix=False, pending_file=None, diff_base=None):
 
 
 # ==================== 静态检查 ====================
-
-def _run_static_checks(affected, project_root):
-    """跑 lint + typecheck，返回是否全部通过。"""
-    # preflight 必跑
-    all_ok = _run_cmd("bash scripts/test-governance-gate.sh preflight", project_root)
-
-    for m in affected:
-        if m.lint_command:
-            if not _run_cmd(m.lint_command, project_root):
-                all_ok = False
-        if m.typecheck_command:
-            if not _run_cmd(m.typecheck_command, project_root):
-                all_ok = False
-
-    return all_ok
-
 
 def _collect_static_failures(affected, project_root):
     """重新跑静态检查，收集失败的命令和错误输出。"""
@@ -201,6 +204,9 @@ def _fix_loop(project_root, affected, initial_failures, modules_by_name):
 
     # 创建修复用 worktree
     wt = create_worktree("ci-fix", project_root)
+    # 手动触发受影响模块的环境预检（create_worktree 的内置预检
+    # 只检查 name="ci-fix" 对应的目录，找不到真实模块的 package.json / go.mod）
+    _precheck_affected_modules(wt, affected)
     logger.info("创建 ci-fix worktree: %s", wt.path)
 
     current_failures = initial_failures
@@ -288,13 +294,15 @@ def _fix_loop(project_root, affected, initial_failures, modules_by_name):
     for failure in current_failures:
         fail_key = (failure["module"], failure["command"])
         pending.append({
-            "reason": f"连续 {consecutive_fail_count.get(fail_key, 0)} 轮修复失败",
+            "reason": f"连续 {consecutive_fail_count.get(fail_key, 0)} 次修复失败",
             **failure,
         })
 
     # 合并或丢弃 worktree
+    # 安全策略：只有全量回归通过（pending 为空）才合并，否则整包丢弃。
+    # 部分修复的 commit 可能包含引入退化的代码，合并到主分支不安全。
     if has_any_fix and not pending:
-        # 全部修好，合并回主分支
+        # 全部修好，回归全绿，合并回主分支
         commit_in_worktree(wt, "evo-ci-fix: 自动修复完成")
         try:
             merge_worktree(wt, project_root)
@@ -308,19 +316,13 @@ def _fix_loop(project_root, affected, initial_failures, modules_by_name):
                 "command": "",
                 "output": str(e),
             })
-    elif has_any_fix:
-        # 部分修好但还有 pending，也合并已修好的部分
-        commit_in_worktree(wt, "evo-ci-fix: 部分自动修复（仍有 pending 问题）")
-        try:
-            merge_worktree(wt, project_root)
-            print("  部分修复已合并到主分支")
-        except Exception as e:
-            logger.error("合并 ci-fix worktree 失败: %s", e)
-            remove_worktree(wt.path, project_root)
     else:
-        # 完全没修好，丢弃 worktree
+        # 有 pending 或完全没修好 → 丢弃 worktree，不合并任何代码到主分支
         remove_worktree(wt.path, project_root)
-        logger.info("无有效修复，已丢弃 ci-fix worktree")
+        if has_any_fix:
+            logger.info("有部分修复但回归未全绿，丢弃 ci-fix worktree（不合并不安全的代码）")
+        else:
+            logger.info("无有效修复，已丢弃 ci-fix worktree")
 
     return pending
 
@@ -445,8 +447,15 @@ def _run_regression_in_worktree(wt, affected):
 
 
 def _reset_worktree(wt):
-    """重置 worktree 到 HEAD 状态，丢弃所有本地改动。"""
+    """重置 worktree 到干净状态，回退 commit + 丢弃改动。"""
     try:
+        # 回退到 worktree 创建时的基准 commit（即主分支 HEAD）
+        subprocess.run(
+            ["git", "reset", "--hard", "HEAD~"],
+            cwd=wt.path,
+            capture_output=True, text=True,
+            # reset 失败（如无 commit 可回退）不致命，继续 checkout
+        )
         subprocess.run(
             ["git", "checkout", "."],
             cwd=wt.path,
@@ -464,6 +473,20 @@ def _reset_worktree(wt):
         logger.info("已重置 worktree: %s", wt.path)
     except Exception as e:
         logger.error("重置 worktree 失败: %s", e)
+
+
+def _precheck_affected_modules(wt, affected):
+    """为受影响模块执行环境预检（npm install / go list 等）。
+
+    create_worktree("ci-fix") 的内置预检按 name="ci-fix" 查找目录，
+    找不到真实模块的 package.json / go.mod，所以这里按实际模块名逐个预检。
+    """
+    from lib.worktree import _precheck_single_module
+    for m in affected:
+        try:
+            _precheck_single_module(wt.path, m.name)
+        except Exception as e:
+            logger.warning("预检模块 %s 异常（不阻塞）: %s", m.name, e)
 
 
 # ==================== pending 输出 ====================
