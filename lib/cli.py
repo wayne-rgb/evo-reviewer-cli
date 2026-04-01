@@ -211,6 +211,11 @@ def _run_finalize(state, project_root):
 
     _self_check(state)
 
+    # 评估持久化：记录本次 review 的摘要到 history.jsonl
+    from lib.steps.history import save_session_summary
+    duration = _estimate_duration(state.session_id)
+    save_session_summary(state, project_root, duration_minutes=duration)
+
     state.advance("done")
     state.save(state.state_file(project_root))
 
@@ -261,6 +266,10 @@ def cmd_review(args):
 
     if not findings:
         print("未发现问题，审查完成。")
+        # 0 findings 也记录到 history（"干净扫描"有信息量）
+        from lib.steps.history import save_session_summary
+        duration = (time.time() - start_time) / 60
+        save_session_summary(state, project_root, duration_minutes=duration)
         state.advance("done")
         state.save(state.state_file(project_root))
         return 0
@@ -401,6 +410,9 @@ def cmd_deep(args):
 
     if not state.findings:
         print("未发现问题，审查完成。")
+        from lib.steps.history import save_session_summary
+        duration = (time.time() - start_time) / 60
+        save_session_summary(state, project_root, duration_minutes=duration)
         state.advance("done")
         state.save(state.state_file(project_root))
         return 0
@@ -744,7 +756,34 @@ def cmd_ci(args):
     return 0 if ok else 1
 
 
+# ==================== trend ====================
+
+def cmd_trend(args):
+    """执行 evo-cli trend：展示历次 review 的趋势分析。"""
+    from lib.steps.history import print_trend
+
+    project_root = _detect_project_root()
+    last_n = getattr(args, "last", 20)
+    print_trend(project_root, last_n=last_n)
+    return 0
+
+
 # ==================== 工具函数 ====================
+
+def _estimate_duration(session_id):
+    """从 session_id（YYYYMMDD-HHMMSS）估算 review 持续时间（分钟）。
+
+    session_id 记录了 review 开始时间，用当前时间减去即可。
+    解析失败时返回 0。
+    """
+    try:
+        from datetime import datetime
+        start = datetime.strptime(session_id, "%Y%m%d-%H%M%S")
+        elapsed = (datetime.now() - start).total_seconds() / 60
+        return round(elapsed, 1)
+    except (ValueError, TypeError):
+        return 0.0
+
 
 def _parse_confirmed(confirmed_arg, state):
     """解析 --confirmed 参数，返回合法的 finding ID 列表。
@@ -891,6 +930,11 @@ def main():
     p_resume.add_argument("--until", choices=VALID_STAGES, help="执行到指定阶段后停止")
     p_resume.add_argument("--confirmed", help="确认的 finding ID 列表（逗号分隔，如 F1,F2,F3）")
     p_resume.set_defaults(func=cmd_resume)
+
+    # trend
+    p_trend = subparsers.add_parser("trend", help="查看历次 review 的趋势分析")
+    p_trend.add_argument("--last", type=int, default=20, help="显示最近 N 次（默认 20）")
+    p_trend.set_defaults(func=cmd_trend)
 
     args = parser.parse_args()
 
