@@ -396,6 +396,15 @@ def generate_final_report(state) -> str:
         for i, b in enumerate(budget_pending, 1):
             lines.append(f"| {i} | {b['severity']} | [{b['id']}] {b['description']} |")
 
+    # ---- R5 三件套报告引用 ----
+    r5_report = _get_state_field(state, "r5_report_path", "")
+    if r5_report:
+        lines.append("")
+        lines.append("### R5 交叉检验报告")
+        lines.append("")
+        lines.append(f"详细 R5 三件套(调用方影响 / 同模式候选 / adversarial 测试)报告:")
+        lines.append(f"📄 `{r5_report}`")
+
     # ---- 被语言过滤器过滤的 findings（审计） ----
     filtered = _get_state_field(state, "filtered_findings", [])
     if filtered:
