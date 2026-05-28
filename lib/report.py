@@ -241,9 +241,17 @@ def generate_final_report(state) -> str:
     phase_c2 = _get_state_field(state, "phase_c2_done", False)
 
     if phase_c1:
-        lines.append("| 回归测试 | 已完成 | 针对已验证 bug 的回归测试 |")
+        c1_failures = _get_state_field(state, "c1_failures", [])
+        c1_preflight_ok = _get_state_field(state, "c1_preflight_ok", True)
+        if c1_failures:
+            failed_ids = ", ".join(f["bug_id"] for f in c1_failures)
+            lines.append(f"| gate 规则(分子化) | 部分完成 | {len(c1_failures)} 失败: {failed_ids} |")
+        elif not c1_preflight_ok:
+            lines.append("| gate 规则(分子化) | 已完成但 preflight 未过 | 需人工检查 gate 文件 |")
+        else:
+            lines.append("| gate 规则(分子化) | 已完成 | 全部 finding 已生成规则 + preflight 通过 |")
     if phase_c2:
-        lines.append("| gate 规则 | 已完成 | test-governance-gate 新增规则 |")
+        lines.append("| 文档 + 趋势治理 | 已完成 | test-governance/* 文档更新 |")
 
     high_freq = _get_state_field(state, "high_freq_rules", [])
     for rule in high_freq:

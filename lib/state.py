@@ -105,6 +105,9 @@ class ReviewState:
     r5_findings: list = field(default_factory=list)  # 老 R5 字段,留着兼容老 state
     # R5 三件套报告路径(新)
     r5_report_path: str = ""
+    # C-1 分子化:per-finding 失败记录 + preflight 最终状态
+    c1_failures: list = field(default_factory=list)  # [{"bug_id":..., "error":...}]
+    c1_preflight_ok: bool = True
     # R3 深度评估详情 {finding_id: {verdict, trigger_probability, trigger_scenario, ...}}(R3 已停用,留兼容)
     evaluate_details: dict = field(default_factory=dict)
 

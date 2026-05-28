@@ -19,6 +19,44 @@ PHASE_C1_PROMPT = """请根据已验证的 bug 编写 gate 规则和测试 helpe
 - 每个规则必须有 log_violation 调用
 - severity 为 BLOCK 或 WARN"""
 
+
+# ===== C-1 分子化:每个 verified bug 独立调用 =====
+PHASE_C1_SINGLE_PROMPT = """根据**这一个**已验证的 bug 编写 gate 规则(必要时附 helper)。
+
+## bug (只处理这一个)
+{bug_json}
+
+## 项目配置
+{config_json}
+
+## 任务(只做这一个 bug,不要扩散到其他 finding 或别的功能)
+1. 在 scripts/test-governance-gate.sh 中添加 **1 条** 规则,检测同类问题
+   - 规则 ID 格式: R{{N}}-{{简短描述}},N 接续现有最大编号
+   - 必须有 log_violation 调用
+   - severity = BLOCK 或 WARN
+2. 如果规则确实需要 helper(资源检测器 / 测试夹具),在对应模块的 helper 目录添加
+3. 如果有新基础设施,**追加 1-2 行** 到 test-governance/infrastructure.md 注册
+4. 如果该 bug 适合做反例,**追加** 1 小段到 test-governance/coding-guidelines.md (❌/✅ 对比)
+
+## 硬性约束
+- 只处理这一个 bug
+- 不要改业务代码 / 测试代码 / 其他模块的文件
+- 不要重写已有 gate 规则,只追加
+- 完成后输出做了哪些改动(简短列表),不要长篇分析
+
+## 预算
+- 最多 10 turns,180 秒
+- 完不成就只完成第 1 项(最重要),其余跳过
+"""
+
+# 单 finding 失败后,跑完所有 finding 再做一次 preflight 修复
+PHASE_C1_PREFLIGHT_FIX_PROMPT = """preflight 检查失败。请读取错误输出修复 gate 规则。
+
+**硬性约束:不要改业务代码,不要扩散到其他文件,只修 gate 规则本身。**
+
+最多 8 turns。完不成就只修最关键的错误。
+"""
+
 PHASE_C2_PROMPT = """请更新文档、处理违规趋势、清理存量问题。
 
 ## 已验证的 bug
