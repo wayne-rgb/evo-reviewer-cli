@@ -266,6 +266,7 @@ def generate_final_report(state) -> str:
     idx = 0
     hallucinations = []
     constraints = []
+    blocked = []  # infra_blocked / compile_broken / needs_manual_review
 
     for fid, result in results.items():
         idx += 1
@@ -288,6 +289,14 @@ def generate_final_report(state) -> str:
                 "reason": reason,
             })
 
+        if status in ("infra_blocked", "compile_broken", "needs_manual_review"):
+            blocked.append({
+                "id": fid,
+                "status": status,
+                "description": desc,
+                "reason": reason,
+            })
+
         if status == "verified" and f.get("constraint"):
             constraints.append({
                 "constraint": f.get("constraint"),
@@ -301,14 +310,22 @@ def generate_final_report(state) -> str:
     lines.append("")
     lines.append("### 验证统计")
     lines.append("")
-    lines.append("| 发现数 | 已验证 | 幻觉 | 修复失败 | 评估跳过 | 未验证 |")
-    lines.append("|--------|--------|------|----------|----------|--------|")
+    # 标注:infra_blocked + compile_broken + needs_manual_review 一律不算"已结论",
+    # 也不当 hallucination — 单列展示让用户知道这部分待人工处理。
+    lines.append("| 发现数 | 已验证 | 幻觉 | 修复失败 | 评估跳过 | 待人工 | 未验证 |")
+    lines.append("|--------|--------|------|----------|----------|--------|--------|")
+    pending_manual = (
+        stats.get("infra_blocked", 0)
+        + stats.get("compile_broken", 0)
+        + stats.get("needs_manual_review", 0)
+    )
     lines.append(
         f"| {stats['total']} "
         f"| {stats['verified']} "
         f"| {stats['hallucination']} "
         f"| {stats['fix_failed']} "
         f"| {stats['eval_skipped']} "
+        f"| {pending_manual} "
         f"| {stats['unverified']} |"
     )
 
@@ -335,6 +352,25 @@ def generate_final_report(state) -> str:
             lines.append(f"| {i} | {h['description']} | {h['reason']} |")
     else:
         lines.append("无幻觉记录。")
+
+    # ---- 待人工处理(infra_blocked / compile_broken / needs_manual_review) ----
+    # 关键:这些 finding 既不是幻觉,也不是已验证 — 自动流程没法结论,要人工
+    if blocked:
+        lines.append("")
+        lines.append("### 待人工裁定(自动结论不可靠)")
+        lines.append("")
+        lines.append("| # | 状态 | bug | 原因 |")
+        lines.append("|---|------|-----|------|")
+        _status_label = {
+            "infra_blocked": "环境未就绪",
+            "compile_broken": "测试代码坏",
+            "needs_manual_review": "R3 评估失败",
+        }
+        for i, b in enumerate(blocked, 1):
+            lines.append(
+                f"| {i} | {_status_label.get(b['status'], b['status'])} "
+                f"| [{b['id']}] {b['description']} | {b['reason']} |"
+            )
 
     # ---- 被语言过滤器过滤的 findings（审计） ----
     filtered = _get_state_field(state, "filtered_findings", [])
@@ -383,6 +419,9 @@ def generate_stats(state) -> dict:
         "unverified": 0,
         "skipped": 0,
         "eval_skipped": 0,
+        "infra_blocked": 0,
+        "compile_broken": 0,
+        "needs_manual_review": 0,
     }
 
     for fid, result in results.items():
@@ -412,7 +451,10 @@ def _status_to_mark(status: str) -> str:
         "fix_failed": "!",
         "unverified": "?",
         "skipped": "-",
-        "eval_skipped": "~",  # R3 深度评估判定不值得修复
+        "eval_skipped": "~",       # R3 深度评估判定不值得修复
+        "infra_blocked": "i",      # 测试环境未就绪 — 结论不可靠
+        "compile_broken": "b",     # 测试代码本身坏了 — 需人工
+        "needs_manual_review": "m",  # R3 评估失败,等人工
     }
     return marks.get(status, "?")
 

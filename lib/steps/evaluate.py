@@ -97,21 +97,41 @@ def run_evaluate(state, project_root, confirmed_ids, modules_by_name):
                     _summarize_verdicts(evaluations),
                 )
             except Exception as e:
-                logger.error(f"{mod_name} 评估失败，该模块全部保留: {e}")
+                logger.error(f"{mod_name} 评估失败，标记 needs_manual_review,不进入 R4: {e}")
                 for f in findings:
-                    results[f["id"]] = {"id": f["id"], "verdict": "verify", "reason": f"评估失败: {e}"}
+                    results[f["id"]] = {
+                        "id": f["id"],
+                        "verdict": "needs_manual_review",
+                        "reason": f"R3 评估失败，需人工裁定: {e}",
+                    }
 
     # 分类（只处理 results 中有评估结果的 ID，过滤无效 ID）
+    # verdict 语义:
+    #   must_fix / verify          → 进 R4 红绿验证
+    #   skip                       → 不修复,记录到 state.results
+    #   needs_manual_review        → R3 评估失败,不进 R4,也不当 skip — 单独 bucket
+    #   (无 ev)                    → 兜底进 R4
     valid_finding_ids = {f["id"] for f in state.findings}
     to_verify = []
     to_skip = []
+    needs_manual = []
     for fid in confirmed_ids:
         if fid not in valid_finding_ids:
             logger.warning(f"confirmed_ids 中的 {fid} 不在 state.findings 中，跳过")
             continue
         ev = results.get(fid)
-        if not ev or ev.get("verdict") in ("verify", "must_fix"):
+        verdict = ev.get("verdict") if ev else None
+
+        if not ev or verdict in ("verify", "must_fix"):
             to_verify.append(fid)
+        elif verdict == "needs_manual_review":
+            # 关键修复点:以前会 fallback 成 verify,导致用户看到的 verify 状态
+            # 其实从未被 R3 真正评估过 — 比明确"评估失败"更危险
+            needs_manual.append(fid)
+            state.results[fid] = {
+                "status": "needs_manual_review",
+                "reason": ev.get("reason", "R3 评估失败,需人工裁定"),
+            }
         else:
             to_skip.append(fid)
             state.results[fid] = {
@@ -128,10 +148,15 @@ def run_evaluate(state, project_root, confirmed_ids, modules_by_name):
     must_fix = sum(1 for ev in results.values() if ev.get("verdict") == "must_fix")
     verify = sum(1 for ev in results.values() if ev.get("verdict") == "verify")
     skip = len(to_skip)
-    logger.info(f"深度评估汇总: must_fix={must_fix}, verify={verify}, skip={skip}")
-    print(f"  must_fix: {must_fix} 个（必须修复）")
-    print(f"  verify:   {verify} 个（需红绿验证确认）")
-    print(f"  skip:     {skip} 个（不值得修复，跳过）")
+    logger.info(
+        f"深度评估汇总: must_fix={must_fix}, verify={verify}, skip={skip}, "
+        f"needs_manual_review={len(needs_manual)}"
+    )
+    print(f"  must_fix:            {must_fix} 个（必须修复）")
+    print(f"  verify:              {verify} 个（需红绿验证确认）")
+    print(f"  skip:                {skip} 个（不值得修复，跳过）")
+    if needs_manual:
+        print(f"  needs_manual_review: {len(needs_manual)} 个（R3 评估失败，需人工）")
 
     return to_verify
 

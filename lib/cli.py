@@ -73,16 +73,34 @@ def _print_verify_summary(state):
     hallucination = _count_status("hallucination")
     fix_failed = _count_status("fix_failed")
     eval_skipped = _count_status("eval_skipped")
-    other = len(state.results) - verified - hallucination - fix_failed - eval_skipped
+    infra_blocked = _count_status("infra_blocked")
+    compile_broken = _count_status("compile_broken")
+    needs_manual = _count_status("needs_manual_review")
+    accounted = (
+        verified + hallucination + fix_failed + eval_skipped
+        + infra_blocked + compile_broken + needs_manual
+    )
+    other = len(state.results) - accounted
 
     print(f"\n{'='*60}")
     print(f"[STAGE_COMPLETE] verify")
     parts = [f"{verified} verified", f"{hallucination} hallucination", f"{fix_failed} fix_failed"]
     if eval_skipped:
         parts.append(f"{eval_skipped} eval_skipped")
+    if infra_blocked:
+        parts.append(f"{infra_blocked} infra_blocked")
+    if compile_broken:
+        parts.append(f"{compile_broken} compile_broken")
+    if needs_manual:
+        parts.append(f"{needs_manual} needs_manual")
     if other:
         parts.append(f"{other} other")
     print(f"验证完成：{' / '.join(parts)}")
+    if infra_blocked or compile_broken or needs_manual:
+        print(
+            "  ⚠️  有 finding 因环境/编译/评估失败未结论 — 见报告"
+            "「待人工裁定」段,修好对应问题后用 `evo-cli resume --confirmed <IDs>` 重跑。"
+        )
     print(f"{'='*60}")
 
 
@@ -618,10 +636,14 @@ def cmd_resume(args):
         else:
             # review 命令：直接进入红绿验证
             # 过滤掉已有验证结果的 bug（verify 中途崩溃后 resume 时避免重复验证）
+            # 但 infra_blocked / compile_broken 是"测试没真跑过"的中间态,
+            # 修好环境后用户 `evo-cli resume` 应该默认重跑这部分。
             already_done = {
                 fid for fid in confirmed_ids
                 if fid in state.results
-                and state.get_result_status(fid) not in ("fix_failed", "")
+                and state.get_result_status(fid) not in (
+                    "fix_failed", "", "infra_blocked", "compile_broken"
+                )
             }
             if already_done:
                 print(f"跳过已验证的 {len(already_done)} 个 bug：{', '.join(sorted(already_done))}")
@@ -652,14 +674,17 @@ def cmd_resume(args):
             _print_evaluate_summary(state)
             return 0
 
-        # --confirmed 覆盖 R3 判定：用户可以把 R3 skip 的 finding 加回来
+        # --confirmed 覆盖 R3 判定：用户可以把 R3 skip / needs_manual 的 finding 加回来
         override_ids = _parse_confirmed(confirmed_arg, state)
         if override_ids is not None:
-            # 用户显式指定了要验证的 ID，撤销这些 ID 的 eval_skipped 状态
+            # 用户显式指定了要验证的 ID，撤销 eval_skipped / needs_manual_review 状态
             for fid in override_ids:
-                if fid in state.results and state.get_result_status(fid) == "eval_skipped":
+                if fid in state.results and state.get_result_status(fid) in (
+                    "eval_skipped", "needs_manual_review"
+                ):
+                    prev = state.get_result_status(fid)
                     del state.results[fid]
-                    logger.info(f"用户覆盖 R3 判定：{fid} 从 eval_skipped 恢复为待验证")
+                    logger.info(f"用户覆盖 R3 判定：{fid} 从 {prev} 恢复为待验证")
             remaining = override_ids
         else:
             # 默认：排除所有已有结果的 findings（eval_skipped + 已验证的）
@@ -699,11 +724,14 @@ def cmd_resume(args):
 
     # --- verify 阶段：可能有未完成的验证，然后收尾 ---
     if phase in ("verify", "cross_validate"):
-        # 检查是否有未验证的 bug
+        # 检查是否有未验证或可重跑的 bug
+        # infra_blocked / compile_broken 表示测试没真跑过 — 环境修好后可重跑
         unverified = [
             f["id"] for f in state.findings
             if f["id"] not in state.results
-            or state.get_result_status(f["id"]) == "fix_failed"
+            or state.get_result_status(f["id"]) in (
+                "fix_failed", "infra_blocked", "compile_broken"
+            )
         ]
         if unverified:
             print(f"发现 {len(unverified)} 个未完成验证的 bug，继续...")
@@ -989,4 +1017,12 @@ def main():
         parser.print_help()
         return 1
 
-    return args.func(args)
+    from lib.worktree import PrecheckError
+    try:
+        return args.func(args)
+    except PrecheckError as e:
+        # 环境预检失败:打印修复指引,以非零码退出。
+        # state 文件已保存,修复环境后可 `evo-cli resume` 续跑。
+        print(f"\n❌ 环境预检失败 — 已中断本次 review。\n\n{e}\n", file=sys.stderr)
+        print("修好环境后可以 `evo-cli resume` 续跑(已保存 state)。\n", file=sys.stderr)
+        return 2

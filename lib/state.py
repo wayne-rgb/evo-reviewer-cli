@@ -38,7 +38,11 @@ class BugStatus(Enum):
     FIX_FAILED = "fix_failed"
     UNVERIFIED = "unverified"
     SKIPPED = "skipped"
-    EVAL_SKIPPED = "eval_skipped"  # R3 深度评估判定不值得修复
+    EVAL_SKIPPED = "eval_skipped"            # R3 深度评估判定不值得修复
+    # 以下三个新状态修复了"测试基础设施挂掉" / "R3 评估失败" 被误标 hallucination 的问题
+    INFRA_BLOCKED = "infra_blocked"          # 测试环境未就绪(go embed 缺资源、testdb 没启动等),无法结论
+    COMPILE_BROKEN = "compile_broken"        # 测试代码本身编译/类型错,需人工
+    NEEDS_MANUAL_REVIEW = "needs_manual_review"  # R3 评估失败,不自动进 R4,等人工裁定
 
 
 @dataclass

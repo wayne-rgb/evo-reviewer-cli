@@ -1,6 +1,7 @@
 """阶段 A：红绿验证 — 每个 bug 独立验证，支持并行"""
 
 import logging
+import re
 import subprocess
 import json
 import os
@@ -15,6 +16,72 @@ MAX_BUGS_PER_MODULE = 10
 MAX_WORKERS = 3
 # 保护 state.results 并发写入
 _results_lock = threading.Lock()
+
+
+# ===== 测试输出的"非业务失败"模式 =====
+# 命中即说明测试根本没真跑到断言层,不应该被当成 hallucination 或 fix_failed
+INFRA_PATTERNS = [
+    re.compile(r"embedded[- ]postgres.*disabled", re.I),
+    re.compile(r"pattern\s+\S+\s*:\s*no matching files found", re.I),
+    re.compile(r"cannot find main module", re.I),
+    re.compile(r"go\.mod file not found", re.I),
+    re.compile(r"connection refused", re.I),
+    re.compile(r"address already in use", re.I),
+    re.compile(r"port\s+\d+\s+already in use", re.I),
+    re.compile(r"no such host", re.I),
+    re.compile(r"context deadline exceeded.*dial", re.I),
+    re.compile(r"docker.*not (running|found)", re.I),
+    re.compile(r"ECONNREFUSED", re.I),
+    re.compile(r"ENOENT.*node_modules", re.I),
+]
+
+# 编译/类型错误:测试代码本身坏了,无法对 bug 做出红绿结论
+COMPILE_BROKEN_PATTERNS = [
+    re.compile(r"\bsyntax error\b", re.I),
+    re.compile(r"^\S+\.go:\d+:\d+:\s+undefined:", re.M),
+    re.compile(r"cannot find package", re.I),
+    re.compile(r"^.*\bTS\d{4}\b:", re.M),
+    re.compile(r"\bbuild failed\b", re.I),
+    re.compile(r"compilation error", re.I),
+    re.compile(r"\bimported and not used\b", re.I),
+]
+
+# 测试 exit_code == 0 但其实没跑到 — 不要标 hallucination
+NO_TESTS_RAN_PATTERNS = [
+    re.compile(r"no tests? ran", re.I),
+    re.compile(r"no tests? found", re.I),
+    re.compile(r"0 passed", re.I),
+    re.compile(r"\[no tests to run\]", re.I),
+]
+
+
+def _classify_test_output(exit_code: int, output: str) -> str:
+    """根据测试退出码 + stderr/stdout 分桶。
+
+    返回:
+      - "green":         exit_code 0 且没有 "no tests ran" 等空跑迹象
+      - "no_tests_ran":  exit_code 0 但测试没真跑(过滤太严/路径错)
+      - "still_red":     exit_code 非0,看起来是真实断言失败
+      - "infra_blocked": exit_code 非0,但命中 INFRA_PATTERNS — 环境问题
+      - "compile_broken":exit_code 非0,但命中 COMPILE_BROKEN_PATTERNS — 测试代码本身坏
+
+    判定顺序很重要:infra/compile 检测要在 still_red 之前 — exit code 一样,
+    但语义完全不同。
+    """
+    text = output or ""
+    if exit_code == 0:
+        for p in NO_TESTS_RAN_PATTERNS:
+            if p.search(text):
+                return "no_tests_ran"
+        return "green"
+
+    for p in INFRA_PATTERNS:
+        if p.search(text):
+            return "infra_blocked"
+    for p in COMPILE_BROKEN_PATTERNS:
+        if p.search(text):
+            return "compile_broken"
+    return "still_red"
 
 
 def run_verify(state, project_root, confirmed_ids, modules_by_name):
@@ -214,11 +281,16 @@ def _verify_must_fix(bug, wt, module, project_root, state=None):
 
     # 2. 跑测试
     test_result = _run_test(wt.path, bug, module)
-    if test_result["exit_code"] == 0:
+    cls = _classify_test_output(test_result["exit_code"], test_result["output"])
+    if cls == "green":
         logger.info(f"[{bug_id}] must_fix 验证通过")
         return {"status": "verified", "test_file": _guess_test_file(bug, module, wt.path)}
+    if cls in ("infra_blocked", "compile_broken", "no_tests_ran"):
+        # 测试根本没跑到 / 测试代码本身坏 — 不能判定修复有效性,也不能判 fix_failed
+        _revert_changes(wt.path, bug, pre_snapshot=pre_snap)
+        return _build_blocked_result(cls, bug_id, test_result["output"])
 
-    # 3. 重试一次
+    # 3. 重试一次 (cls == "still_red")
     logger.info(f"[{bug_id}] must_fix 测试失败，重试")
     retry_prompt = RETRY_FIX_PROMPT.format(
         bug_id=bug_id,
@@ -241,11 +313,14 @@ def _verify_must_fix(bug, wt, module, project_root, state=None):
         return {"status": "fix_failed", "reason": f"must_fix 重试失败: {e}"}
 
     retry_result = _run_test(wt.path, bug, module)
-    if retry_result["exit_code"] == 0:
+    retry_cls = _classify_test_output(retry_result["exit_code"], retry_result["output"])
+    if retry_cls == "green":
         logger.info(f"[{bug_id}] must_fix 重试后验证通过")
         return {"status": "verified", "test_file": _guess_test_file(bug, module, wt.path)}
 
     _revert_changes(wt.path, bug, pre_snapshot=pre_snap)
+    if retry_cls in ("infra_blocked", "compile_broken", "no_tests_ran"):
+        return _build_blocked_result(retry_cls, bug_id, retry_result["output"])
     logger.info(f"[{bug_id}] must_fix 修复失败")
     return {"status": "fix_failed", "reason": "must_fix 重试后测试仍失败"}
 
@@ -304,14 +379,23 @@ def _verify_red_green(bug, wt, module, project_root):
 
     # 2. CLI 跑测试
     test_result = _run_test(wt.path, bug, module)
+    cls = _classify_test_output(test_result["exit_code"], test_result["output"])
 
-    # 3. 测试通过 -> 幻觉
-    if test_result["exit_code"] == 0:
+    # 3. 红测试结果分类
+    if cls == "green":
+        # 红测试直接通过 — 真幻觉,bug 写测试都验不出
         _revert_changes(wt.path, bug, pre_snapshot=pre_snap)
         logger.info(f"[{bug_id}] 幻觉 — 测试直接通过")
         return {"status": "hallucination", "reason": "测试直接通过，bug 不存在"}
 
-    # 4. 检查失败原因
+    if cls in ("infra_blocked", "compile_broken", "no_tests_ran"):
+        # 测试根本没跑(环境坏 / 编译失败 / 路径错过滤错)
+        # 关键修复点:这里以前会落入 CHECK_REASON 让 opus 判,opus 多半会判"无关"
+        # 然后错标 hallucination — 是评估失真的主要来源
+        _revert_changes(wt.path, bug, pre_snapshot=pre_snap)
+        return _build_blocked_result(cls, bug_id, test_result["output"])
+
+    # 4. cls == "still_red" — 检查失败原因(是不是和 bug 真相关)
     output_tail = _tail(test_result["output"], 50)
     try:
         reason = call_claude_bare(
@@ -367,10 +451,16 @@ def _verify_red_green(bug, wt, module, project_root):
 
     # 6. CLI 跑测试
     fix_result = _run_test(wt.path, bug, module)
+    fix_cls = _classify_test_output(fix_result["exit_code"], fix_result["output"])
 
-    if fix_result["exit_code"] == 0:
+    if fix_cls == "green":
         logger.info(f"[{bug_id}] 验证通过")
         return {"status": "verified", "test_file": _guess_test_file(bug, module, wt.path)}
+
+    if fix_cls in ("infra_blocked", "compile_broken", "no_tests_ran"):
+        # 修复完测试跑不起来 — 修复动作可能引入了编译错或破了环境
+        _revert_changes(wt.path, bug, pre_snapshot=pre_snap)
+        return _build_blocked_result(fix_cls, bug_id, fix_result["output"])
 
     # 7. 重试一次
     logger.info(f"[{bug_id}] 修复后测试仍失败，重试")
@@ -395,13 +485,44 @@ def _verify_red_green(bug, wt, module, project_root):
         return {"status": "fix_failed", "reason": f"重试失败: {e}"}
 
     retry_result = _run_test(wt.path, bug, module)
-    if retry_result["exit_code"] == 0:
+    retry_cls = _classify_test_output(retry_result["exit_code"], retry_result["output"])
+    if retry_cls == "green":
         logger.info(f"[{bug_id}] 重试后验证通过")
         return {"status": "verified", "test_file": _guess_test_file(bug, module, wt.path)}
 
     _revert_changes(wt.path, bug, pre_snapshot=pre_snap)
+    if retry_cls in ("infra_blocked", "compile_broken", "no_tests_ran"):
+        return _build_blocked_result(retry_cls, bug_id, retry_result["output"])
     logger.info(f"[{bug_id}] 修复失败")
     return {"status": "fix_failed", "reason": "重试后测试仍失败"}
+
+
+def _build_blocked_result(cls: str, bug_id: str, output: str) -> dict:
+    """根据分类结果生成 verify 阶段的 blocked 状态结果。
+
+    infra_blocked / compile_broken / no_tests_ran 都意味着"测试本身没真跑过 bug",
+    所以既不能标 verified、也不能标 hallucination、更不能标 fix_failed。
+    专门用 infra_blocked / compile_broken 这两个状态,让用户能看到真相。
+    """
+    tail = _tail(output, 10)
+    if cls == "infra_blocked":
+        logger.warning(f"[{bug_id}] infra_blocked — 测试环境未就绪:\n{tail}")
+        return {
+            "status": "infra_blocked",
+            "reason": f"测试环境未就绪(命中 INFRA_PATTERNS),需修复环境后重跑: {tail[:200]}",
+        }
+    if cls == "compile_broken":
+        logger.warning(f"[{bug_id}] compile_broken — 测试代码编译失败:\n{tail}")
+        return {
+            "status": "compile_broken",
+            "reason": f"测试代码编译/类型检查失败,需人工: {tail[:200]}",
+        }
+    # no_tests_ran
+    logger.warning(f"[{bug_id}] no_tests_ran — 测试未真正运行:\n{tail}")
+    return {
+        "status": "infra_blocked",
+        "reason": f"测试命令返回 0 但实际没跑(过滤/路径错): {tail[:200]}",
+    }
 
 
 def _build_cross_module_hint(bug):

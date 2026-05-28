@@ -15,6 +15,15 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+class PrecheckError(RuntimeError):
+    """worktree 预检失败 — infra 没准备好,继续跑 review 必然误判。
+
+    抛出后由 cli 顶层捕获,打印修复指引并以非零码退出。
+    不要在 review 中途吞掉:这正是过去把 "go embed 资源缺失" / "testdb 未启动"
+    错标成 finding hallucination 的根因。
+    """
+
+
 @dataclass
 class Worktree:
     """一个 git worktree 实例"""
@@ -51,14 +60,38 @@ def plan_worktrees(modules: list, project_root: str) -> dict:
     logger.info("worktree 分组结果: %d 个组（来自 %d 个模块）", len(groups), len(modules))
 
     worktrees = {}
-    for key, group_modules in groups.items():
-        # 用组内第一个模块的名称作为 worktree 名称
-        first_name = _module_name(group_modules[0])
-        wt = create_worktree(first_name, project_root)
-        # 记录该 worktree 包含的所有模块
-        wt.modules = [_module_name(m) for m in group_modules]
-        for m in group_modules:
-            worktrees[_module_name(m)] = wt
+    try:
+        for key, group_modules in groups.items():
+            # 用组内第一个模块的名称作为 worktree 名称
+            first_name = _module_name(group_modules[0])
+            # 关键:create_worktree 内部会用 [first_name] 跑预检,
+            # 而真实模块名可能是 group 中其他成员 — 先建 wt 占位,
+            # 再用完整 modules 列表手动预检
+            wt = create_worktree(first_name, project_root)
+            # 记录该 worktree 包含的所有模块
+            wt.modules = [_module_name(m) for m in group_modules]
+            # 对组内其他模块补一次预检(create_worktree 只查了 first_name)
+            if len(group_modules) > 1:
+                try:
+                    _precheck_worktree(wt, project_root)
+                except PrecheckError:
+                    remove_worktree(wt.path, project_root)
+                    subprocess.run(
+                        ["git", "branch", "-D", wt.branch],
+                        cwd=project_root, capture_output=True, text=True,
+                    )
+                    raise
+            for m in group_modules:
+                worktrees[_module_name(m)] = wt
+    except PrecheckError:
+        # 清理已成功创建的 worktree,避免半截状态
+        for wt in {id(w): w for w in worktrees.values()}.values():
+            remove_worktree(wt.path, project_root)
+            subprocess.run(
+                ["git", "branch", "-D", wt.branch],
+                cwd=project_root, capture_output=True, text=True,
+            )
+        raise
 
     return worktrees
 
@@ -97,7 +130,17 @@ def create_worktree(name: str, project_root: str) -> Worktree:
     logger.debug("git worktree add 输出: %s", result.stdout.strip())
 
     wt = Worktree(path=path, branch=branch, modules=[name])
-    _precheck_worktree(wt, project_root)
+    try:
+        _precheck_worktree(wt, project_root)
+    except PrecheckError:
+        # 预检失败必须清理已创建的 worktree + 分支,否则下次重跑会撞名
+        logger.info("预检失败,清理已创建的 worktree: %s", path)
+        remove_worktree(path, project_root)
+        subprocess.run(
+            ["git", "branch", "-D", branch],
+            cwd=project_root, capture_output=True, text=True,
+        )
+        raise
     return wt
 
 
@@ -294,20 +337,36 @@ def _precheck_worktree(wt: Worktree, project_root: str) -> None:
 
     按语言检测常见问题：
     - Go: 确保 go.mod 可被识别（go list），防止 "cannot find main module"
+       / "pattern X: no matching files found"（embed 资源未生成）
     - TypeScript: 如果有 package.json 但无 node_modules，跑 npm install
     - Swift: 无需特殊处理（Xcode 自动管理）
 
-    预检失败只记 warning，不阻塞流程。所有操作包在 try-except 中防止崩溃。
+    失败语义：
+    - 可自动恢复的（缺 node_modules 等）→ 内部修复，继续。
+    - 不可自动恢复的（go embed 资源缺失、go.mod 损坏）→ raise PrecheckError，
+      由 cli 顶层捕获并打印用户可执行的修复指引。
+      过去 logger.warning + 继续的策略导致 verify 阶段大量误判，已废弃。
     """
+    failures = []
     for mod_name in wt.modules:
         try:
             _precheck_single_module(wt.path, mod_name)
+        except PrecheckError as e:
+            failures.append(str(e))
         except Exception as e:
-            logger.warning("worktree 预检 %s 异常（不阻塞）: %s", mod_name, e)
+            # 预检逻辑本身崩溃（不是模块环境问题），不阻塞但要醒目
+            logger.error("worktree 预检 %s 逻辑异常: %s", mod_name, e)
+
+    if failures:
+        raise PrecheckError(
+            "worktree {path} 预检失败,以下模块环境未准备好:\n  - {detail}\n\n"
+            "请先在主仓库准备好对应模块的构建产物 / 依赖,再重试 review。"
+            .format(path=wt.path, detail="\n  - ".join(failures))
+        )
 
 
 def _precheck_single_module(wt_path: str, mod_name: str) -> None:
-    """单个模块的环境预检。"""
+    """单个模块的环境预检。go 模块失败抛 PrecheckError，TypeScript 自动恢复。"""
     mod_dir = os.path.join(wt_path, mod_name)
 
     # Go 模块检查 — 在模块目录或 worktree 根目录找 go.mod
@@ -322,12 +381,15 @@ def _precheck_single_module(wt_path: str, mod_name: str) -> None:
             capture_output=True, text=True, timeout=30,
         )
         if result.returncode != 0:
-            logger.warning(
-                "worktree 预检: Go 模块 %s 的 go list 失败: %s",
-                mod_name, result.stderr[:200],
+            stderr_tail = result.stderr.strip().splitlines()[-3:]
+            stderr_msg = "\n      ".join(stderr_tail) if stderr_tail else "(无 stderr)"
+            hint = _go_fix_hint(result.stderr)
+            raise PrecheckError(
+                f"Go 模块 {mod_name} (cwd={go_dir}) `go list ./...` 失败:\n"
+                f"      {stderr_msg}\n"
+                f"    修复建议: {hint}"
             )
-        else:
-            logger.info("worktree 预检: Go 模块 %s 可用", mod_name)
+        logger.info("worktree 预检: Go 模块 %s 可用", mod_name)
 
     # TypeScript 模块检查 — 在模块目录找 package.json
     pkg_json = os.path.join(mod_dir, "package.json")
@@ -342,6 +404,23 @@ def _precheck_single_module(wt_path: str, mod_name: str) -> None:
             )
         else:
             logger.info("worktree 预检: TypeScript 模块 %s 可用", mod_name)
+
+
+def _go_fix_hint(stderr: str) -> str:
+    """根据 go list stderr 给出最可能的修复指令。"""
+    s = stderr or ""
+    if "no matching files found" in s:
+        # go embed 指向的目录缺失,通常是前端 dist / 静态资源未构建
+        if "frontend/dist" in s or "ui/dist" in s:
+            return "缺少前端构建产物 — 请在主仓库执行 `pnpm build` (或 `npm run build`)"
+        if "static" in s:
+            return "缺少 embed 静态资源 — 请在主仓库先执行对应的资源生成命令"
+        return "go:embed 指向的目录/文件不存在 — 请先生成对应资源"
+    if "cannot find main module" in s or "go.mod file not found" in s:
+        return "go.mod 路径有误 — 检查 config.yaml 中模块 src_dir 配置"
+    if "no required module provides" in s or "missing go.sum entry" in s:
+        return "依赖未同步 — 请在主仓库执行 `go mod download` 或 `go mod tidy`"
+    return "请在主仓库手动执行 `go list ./...` 复现并排查"
 
 
 def _module_name(module) -> str:
