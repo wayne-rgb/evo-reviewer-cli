@@ -76,9 +76,10 @@ def _print_verify_summary(state):
     infra_blocked = _count_status("infra_blocked")
     compile_broken = _count_status("compile_broken")
     needs_manual = _count_status("needs_manual_review")
+    budget = _count_status("unverified_by_budget")
     accounted = (
         verified + hallucination + fix_failed + eval_skipped
-        + infra_blocked + compile_broken + needs_manual
+        + infra_blocked + compile_broken + needs_manual + budget
     )
     other = len(state.results) - accounted
 
@@ -93,6 +94,8 @@ def _print_verify_summary(state):
         parts.append(f"{compile_broken} compile_broken")
     if needs_manual:
         parts.append(f"{needs_manual} needs_manual")
+    if budget:
+        parts.append(f"{budget} budget_pending")
     if other:
         parts.append(f"{other} other")
     print(f"验证完成：{' / '.join(parts)}")
@@ -100,6 +103,11 @@ def _print_verify_summary(state):
         print(
             "  ⚠️  有 finding 因环境/编译/评估失败未结论 — 见报告"
             "「待人工裁定」段,修好对应问题后用 `evo-cli resume --confirmed <IDs>` 重跑。"
+        )
+    if budget:
+        print(
+            f"  ⏱  R4 总预算耗尽,有 {budget} 个 finding 未跑 — "
+            f"直接 `evo-cli resume` 即可续跑(已按 severity 排序)。"
         )
     print(f"{'='*60}")
 
@@ -481,27 +489,21 @@ def cmd_deep(args):
         print(f"\n耗时：{elapsed:.1f} 分钟（--until confirm 停止）")
         return 0
 
-    # --- R3：深度评估 ---
-    print("\n=== R3：深度评估（opus） ===\n")
+    # --- R3：深度评估 (已停用,见 commit history) ---
+    # R3 用 LLM 法官筛 LLM finder,在安全产品场景下系统性低估真 bug
+    # (实战数据:4/14 个真 bug 被 R3 错标 skip)。
+    # R4 已经按 severity 排序 + 总预算 30 分钟,等价于让 R3 的"筛选职责"
+    # 退化为 R4 的"按重要性排时间"。如需 R3 advisory 信息,后续可以做
+    # 独立子命令 `evo-cli evaluate`。
     modules_by_name = {m.name: m for m in modules}
-    from lib.steps.evaluate import run_evaluate
-    ids_to_verify = run_evaluate(state, project_root, confirmed_ids, modules_by_name)
+    ids_to_verify = confirmed_ids
+    # 标记 evaluate 阶段已通过(对 resume 兼容老 state 有用)
     state.advance("evaluate")
     state.save(state.state_file(project_root))
 
-    if not ids_to_verify:
-        print("深度评估认为所有发现均不值得红绿验证，跳到收尾。")
-        state.advance("verify")
-        state.save(state.state_file(project_root))
-        _run_finalize(state, project_root)
-        elapsed = (time.time() - start_time) / 60
-        print(f"\n总耗时：{elapsed:.1f} 分钟")
-        return 0
-
     if _should_stop(until, "evaluate"):
-        _print_evaluate_summary(state)
         elapsed = (time.time() - start_time) / 60
-        print(f"\n耗时：{elapsed:.1f} 分钟（--until evaluate 停止）")
+        print(f"\n耗时：{elapsed:.1f} 分钟（--until evaluate 停止；R3 已停用）")
         return 0
 
     # --- R4：红绿验证 ---
@@ -608,41 +610,30 @@ def cmd_resume(args):
                 # 没有 --confirmed，用全部 findings
                 confirmed_ids = [f["id"] for f in state.findings]
 
-        # deep 命令：先执行 R3 深度评估，过滤低价值 findings
+        # deep 命令: R3 已停用,直接进入 R4(R4 内部按 severity 排序 + 总预算)
         if state.command == "deep":
-            print("\n=== R3：深度评估（opus） ===\n")
-            from lib.steps.evaluate import run_evaluate
-            confirmed_ids = run_evaluate(state, project_root, confirmed_ids, modules_by_name)
-            state.advance("evaluate")
+            state.advance("evaluate")  # 兼容老 state
             state.save(state.state_file(project_root))
 
-            if not confirmed_ids:
-                print("深度评估认为所有发现均不值得红绿验证，跳到收尾。")
-                state.advance("verify")
-                state.save(state.state_file(project_root))
-                _run_finalize(state, project_root)
-                elapsed = (time.time() - start_time) / 60
-                print(f"\n总耗时：{elapsed:.1f} 分钟")
-                return 0
-
             if _should_stop(until, "evaluate"):
-                _print_evaluate_summary(state)
                 elapsed = (time.time() - start_time) / 60
-                print(f"\n耗时：{elapsed:.1f} 分钟（--until evaluate 停止）")
+                print(f"\n耗时：{elapsed:.1f} 分钟（--until evaluate 停止；R3 已停用）")
                 return 0
 
-            phase = "evaluate"  # fall through 到 evaluate 分支
+            phase = "evaluate"  # fall through 到 evaluate 分支(走 verify 逻辑)
 
         else:
             # review 命令：直接进入红绿验证
             # 过滤掉已有验证结果的 bug（verify 中途崩溃后 resume 时避免重复验证）
-            # 但 infra_blocked / compile_broken 是"测试没真跑过"的中间态,
-            # 修好环境后用户 `evo-cli resume` 应该默认重跑这部分。
+            # 但以下状态都是"测试没真跑过"或"被预算砍掉",resume 应默认重跑:
+            #   infra_blocked / compile_broken — 环境修好后重跑
+            #   unverified_by_budget — 上次预算耗尽,这次继续
             already_done = {
                 fid for fid in confirmed_ids
                 if fid in state.results
                 and state.get_result_status(fid) not in (
-                    "fix_failed", "", "infra_blocked", "compile_broken"
+                    "fix_failed", "", "infra_blocked", "compile_broken",
+                    "unverified_by_budget",
                 )
             }
             if already_done:
@@ -668,40 +659,39 @@ def cmd_resume(args):
 
             phase = "verify"  # fall through
 
-    # --- evaluate 阶段：deep 模式的 R3 深度评估后 resume ---
+    # --- evaluate 阶段：R3 已停用,此处仅作为 R4 入口 + 兼容老 state ---
     if phase == "evaluate":
         if _should_stop(until, "evaluate"):
-            _print_evaluate_summary(state)
             return 0
 
-        # --confirmed 覆盖 R3 判定：用户可以把 R3 skip / needs_manual 的 finding 加回来
+        # 兼容老 state:R3 时代标的 eval_skipped / needs_manual_review 可被 --confirmed 撤销
         override_ids = _parse_confirmed(confirmed_arg, state)
         if override_ids is not None:
-            # 用户显式指定了要验证的 ID，撤销 eval_skipped / needs_manual_review 状态
             for fid in override_ids:
                 if fid in state.results and state.get_result_status(fid) in (
                     "eval_skipped", "needs_manual_review"
                 ):
                     prev = state.get_result_status(fid)
                     del state.results[fid]
-                    logger.info(f"用户覆盖 R3 判定：{fid} 从 {prev} 恢复为待验证")
+                    logger.info(f"用户覆盖老 R3 判定:{fid} 从 {prev} 恢复为待验证")
             remaining = override_ids
         else:
-            # 默认：排除所有已有结果的 findings（eval_skipped + 已验证的）
+            # 默认:跑所有还没结论的 finding
             remaining = [
                 f["id"] for f in state.findings
                 if f["id"] not in state.results
             ]
-        skipped_count = sum(
+        legacy_skipped = sum(
             1 for r in state.results.values()
             if (r.get("status") if isinstance(r, dict) else getattr(r, "status", "")) == "eval_skipped"
         )
         if remaining:
-            print(f"\n=== R4：红绿验证（{len(remaining)} 个 bug，{skipped_count} 个已被 R3 跳过） ===\n")
+            extra = f"({legacy_skipped} 个老 R3 标 skip,用 --confirmed 可拉回)" if legacy_skipped else ""
+            print(f"\n=== R4：红绿验证（{len(remaining)} 个 bug{extra}） ===\n")
             from lib.steps.verify import run_verify
             run_verify(state, project_root, remaining, modules_by_name)
         else:
-            print("所有 findings 已被 R3 评估跳过，无需红绿验证。")
+            print("所有 finding 都已有结论,无需 R4。")
 
         state.advance("verify")
         state.save(state.state_file(project_root))
@@ -724,13 +714,15 @@ def cmd_resume(args):
 
     # --- verify 阶段：可能有未完成的验证，然后收尾 ---
     if phase in ("verify", "cross_validate"):
-        # 检查是否有未验证或可重跑的 bug
-        # infra_blocked / compile_broken 表示测试没真跑过 — 环境修好后可重跑
+        # 检查是否有未验证或可重跑的 bug:
+        #   infra_blocked / compile_broken — 测试没真跑过,环境修好后可重跑
+        #   unverified_by_budget — 上次 R4 预算耗尽,resume 续跑
         unverified = [
             f["id"] for f in state.findings
             if f["id"] not in state.results
             or state.get_result_status(f["id"]) in (
-                "fix_failed", "infra_blocked", "compile_broken"
+                "fix_failed", "infra_blocked", "compile_broken",
+                "unverified_by_budget",
             )
         ]
         if unverified:

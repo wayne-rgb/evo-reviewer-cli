@@ -267,6 +267,7 @@ def generate_final_report(state) -> str:
     hallucinations = []
     constraints = []
     blocked = []  # infra_blocked / compile_broken / needs_manual_review
+    budget_pending = []  # unverified_by_budget — 自动可续跑
 
     for fid, result in results.items():
         idx += 1
@@ -297,6 +298,13 @@ def generate_final_report(state) -> str:
                 "reason": reason,
             })
 
+        if status == "unverified_by_budget":
+            budget_pending.append({
+                "id": fid,
+                "description": desc,
+                "severity": f.get("severity", "?"),
+            })
+
         if status == "verified" and f.get("constraint"):
             constraints.append({
                 "constraint": f.get("constraint"),
@@ -310,15 +318,17 @@ def generate_final_report(state) -> str:
     lines.append("")
     lines.append("### 验证统计")
     lines.append("")
-    # 标注:infra_blocked + compile_broken + needs_manual_review 一律不算"已结论",
-    # 也不当 hallucination — 单列展示让用户知道这部分待人工处理。
-    lines.append("| 发现数 | 已验证 | 幻觉 | 修复失败 | 评估跳过 | 待人工 | 未验证 |")
-    lines.append("|--------|--------|------|----------|----------|--------|--------|")
+    # 标注:
+    #   infra_blocked + compile_broken + needs_manual_review = 待人工
+    #   unverified_by_budget = 自动可续跑(resume 即可)
+    lines.append("| 发现数 | 已验证 | 幻觉 | 修复失败 | 评估跳过 | 待人工 | 待续跑 | 未验证 |")
+    lines.append("|--------|--------|------|----------|----------|--------|--------|--------|")
     pending_manual = (
         stats.get("infra_blocked", 0)
         + stats.get("compile_broken", 0)
         + stats.get("needs_manual_review", 0)
     )
+    pending_budget = stats.get("unverified_by_budget", 0)
     lines.append(
         f"| {stats['total']} "
         f"| {stats['verified']} "
@@ -326,6 +336,7 @@ def generate_final_report(state) -> str:
         f"| {stats['fix_failed']} "
         f"| {stats['eval_skipped']} "
         f"| {pending_manual} "
+        f"| {pending_budget} "
         f"| {stats['unverified']} |"
     )
 
@@ -371,6 +382,19 @@ def generate_final_report(state) -> str:
                 f"| {i} | {_status_label.get(b['status'], b['status'])} "
                 f"| [{b['id']}] {b['description']} | {b['reason']} |"
             )
+
+    # ---- 待续跑(unverified_by_budget) ----
+    # 这部分 finding R4 时间预算耗尽时被跳过 — 用 `evo-cli resume` 即可续跑
+    if budget_pending:
+        lines.append("")
+        lines.append(f"### R4 预算耗尽待续跑({len(budget_pending)} 个)")
+        lines.append("")
+        lines.append("R4 总预算耗尽,以下 finding 还没跑红绿。`evo-cli resume` 即可续:")
+        lines.append("")
+        lines.append("| # | severity | bug |")
+        lines.append("|---|----------|-----|")
+        for i, b in enumerate(budget_pending, 1):
+            lines.append(f"| {i} | {b['severity']} | [{b['id']}] {b['description']} |")
 
     # ---- 被语言过滤器过滤的 findings（审计） ----
     filtered = _get_state_field(state, "filtered_findings", [])
@@ -422,6 +446,7 @@ def generate_stats(state) -> dict:
         "infra_blocked": 0,
         "compile_broken": 0,
         "needs_manual_review": 0,
+        "unverified_by_budget": 0,
     }
 
     for fid, result in results.items():
@@ -451,10 +476,11 @@ def _status_to_mark(status: str) -> str:
         "fix_failed": "!",
         "unverified": "?",
         "skipped": "-",
-        "eval_skipped": "~",       # R3 深度评估判定不值得修复
-        "infra_blocked": "i",      # 测试环境未就绪 — 结论不可靠
-        "compile_broken": "b",     # 测试代码本身坏了 — 需人工
-        "needs_manual_review": "m",  # R3 评估失败,等人工
+        "eval_skipped": "~",         # 老 R3 跳过
+        "infra_blocked": "i",        # 测试环境未就绪 — 结论不可靠
+        "compile_broken": "b",       # 测试代码本身坏了 — 需人工
+        "needs_manual_review": "m",  # 老 R3 评估失败
+        "unverified_by_budget": "T", # R4 总预算耗尽,resume 续跑可继续
     }
     return marks.get(status, "?")
 

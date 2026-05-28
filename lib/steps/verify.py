@@ -3,6 +3,7 @@
 import logging
 import re
 import subprocess
+import time
 import json
 import os
 import threading
@@ -14,6 +15,10 @@ logger = logging.getLogger(__name__)
 MAX_BUGS_PER_MODULE = 10
 # 并行 worker 数
 MAX_WORKERS = 3
+# R4 总时间预算(分钟):超时则停,剩下标 unverified_by_budget,不丢 finding
+R4_TOTAL_BUDGET_MINUTES = 30
+# Severity → 排序权重(数字越小越优先)
+SEVERITY_ORDER = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
 # 保护 state.results 并发写入
 _results_lock = threading.Lock()
 
@@ -90,18 +95,36 @@ def run_verify(state, project_root, confirmed_ids, modules_by_name):
     按模块分组，每个模块创建 worktree，模块间并行。
     同模块内，不同文件的 bug 并行，同文件的 bug 串行。
 
+    R3 停用后,R4 自行承担"按重要性排时间"的职责:
+      - 入口按 R1 severity 排序(HIGH > MEDIUM > LOW)
+      - 模块内 overflow 截断也按 severity,确保真 bug 不会因列表顺序被丢
+      - 总预算 R4_TOTAL_BUDGET_MINUTES,超时剩余 finding 标 unverified_by_budget
+
     Args:
         confirmed_ids: 确认的 finding ID 列表
         modules_by_name: {name: ModuleConfig} 映射
     """
     from lib.worktree import plan_worktrees, commit_in_worktree
 
-    # 按模块分组
+    # 按 severity 排序 confirmed_ids — R3 停用后这是 R4 唯一的"重要性信号"
+    findings_by_id = {f["id"]: f for f in state.findings}
+    confirmed_ids = sorted(
+        [fid for fid in confirmed_ids if fid in findings_by_id],
+        key=lambda fid: SEVERITY_ORDER.get(
+            findings_by_id[fid].get("severity", "").upper(), 3
+        )
+    )
+
+    # 总预算 deadline:用 wall-clock 而非累计时间 — 并行时简单可靠
+    deadline = time.time() + R4_TOTAL_BUDGET_MINUTES * 60
+    state._r4_deadline = deadline  # 透传给 _verify_single_bug
+
+    # 按模块分组 — 组内仍按 severity 排序保留
     bugs_by_module = {}
-    for f in state.findings:
-        if f["id"] in confirmed_ids:
-            mod = f.get("module", "unknown")
-            bugs_by_module.setdefault(mod, []).append(f)
+    for fid in confirmed_ids:
+        f = findings_by_id[fid]
+        mod = f.get("module", "unknown")
+        bugs_by_module.setdefault(mod, []).append(f)
 
     # 创建 worktrees
     active_modules = [modules_by_name[name] for name in bugs_by_module if name in modules_by_name]
@@ -146,20 +169,23 @@ def _verify_module(state, project_root, mod_name, bugs, wt, module):
     """验证单个模块的所有 bug"""
     from lib.worktree import commit_in_worktree
 
-    # 效率约束：最多 10 个
+    # 效率约束:最多 10 个。bugs 已按 severity 排序进来,切片自动保留高 severity
     active_bugs = bugs[:MAX_BUGS_PER_MODULE]
     overflow = bugs[MAX_BUGS_PER_MODULE:]
 
     if overflow:
         logger.warning(
-            "%s: %d 个 bug 超出模块上限（MAX=%d），跳过：%s",
-            mod_name, len(overflow), MAX_BUGS_PER_MODULE,
-            ", ".join(b["id"] for b in overflow),
+            "%s: %d 个 bug 超出模块上限(MAX=%d),按 severity 已保留前 %d 个,溢出:%s",
+            mod_name, len(overflow), MAX_BUGS_PER_MODULE, MAX_BUGS_PER_MODULE,
+            ", ".join(f"{b['id']}({b.get('severity','?')})" for b in overflow),
         )
-        print(f"  ⚠️ {mod_name}: 跳过 {len(overflow)} 个 bug（超出模块上限 {MAX_BUGS_PER_MODULE}）")
+        print(f"  ⚠️ {mod_name}: 模块上限 {MAX_BUGS_PER_MODULE} 已达,溢出 {len(overflow)} 个低 severity")
     for bug in overflow:
         with _results_lock:
-            state.results[bug["id"]] = {"status": "skipped", "reason": "超出模块上限"}
+            state.results[bug["id"]] = {
+                "status": "skipped",
+                "reason": f"模块上限 {MAX_BUGS_PER_MODULE} 已达,severity={bug.get('severity','?')} 被截断",
+            }
             state.overflow.append(bug["id"])
 
     # 按文件分组：同文件串行，不同文件并行
@@ -211,14 +237,24 @@ def _verify_file_bugs(bugs, wt, module, project_root, state=None):
 
 
 def _verify_single_bug(bug, wt, module, project_root, state=None):
-    """单个 bug 的验证。根据 R3 verdict 分流：
+    """单个 bug 的验证。
 
-    must_fix（R3 已确认真实）：跳过红测试，直接修复 + 绿测试验证
-    其他（verify / 无 R3）：标准红绿验证流程
+    R3 停用后,统一走 _verify_red_green 流程。
+    入口先检查 R4 总预算 deadline,超时直接标 unverified_by_budget 不丢 finding。
+    保留 must_fix 快速路径 — 兼容老 state(R3 时代标的 must_fix verdict)。
     """
     bug_id = bug["id"]
 
-    # 检查 R3 verdict：must_fix 走快速路径
+    # 总预算超时检查 — 在做任何昂贵动作前
+    deadline = getattr(state, "_r4_deadline", None) if state else None
+    if deadline and time.time() > deadline:
+        logger.warning(f"[{bug_id}] R4 总预算耗尽,跳过验证")
+        return {
+            "status": "unverified_by_budget",
+            "reason": f"R4 总预算 {R4_TOTAL_BUDGET_MINUTES} 分钟已耗尽 — 用 `evo-cli resume` 续跑剩余 finding",
+        }
+
+    # 兼容老 state:R3 标的 must_fix 仍走快速路径
     eval_verdict = None
     if state and hasattr(state, "evaluate_details"):
         eval_detail = state.evaluate_details.get(bug_id, {})
