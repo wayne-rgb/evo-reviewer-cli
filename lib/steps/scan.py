@@ -1,6 +1,6 @@
 """阶段 1：代码扫描（opus，按模块并行，聚焦变更文件 + 边界展开）"""
 
-import logging, json
+import logging, json, os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
@@ -33,7 +33,13 @@ def run_scan(state, project_root, modules):
 
     all_findings = []
 
-    with ThreadPoolExecutor(max_workers=max(1, len(modules))) as pool:
+    # 并发度控制 · 2026-05-28 默认改 1 串行(诊断 macOS 多并发 claude 子进程 stderr 空退码 1
+    # 挂死 · 疑 jetsam OOM kill 或 file descriptor 限制) · EVO_CLI_MAX_WORKERS env 覆盖回滚并行。
+    max_workers_env = int(os.environ.get("EVO_CLI_MAX_WORKERS", "1"))
+    max_workers = max(1, min(max_workers_env, len(modules)))
+    logger.info(f"scan max_workers={max_workers}(env EVO_CLI_MAX_WORKERS 覆盖 · 默认 1 串行)")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {}
         for m in modules:
             prompt = _build_scan_prompt(
