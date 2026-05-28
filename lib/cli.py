@@ -113,14 +113,9 @@ def _print_verify_summary(state):
 
 
 def _print_evaluate_summary(state):
-    """R3 深度评估完成后的摘要，展示每个 finding 的评估结果。
+    """老 R3 深度评估摘要展示 — R3 已停用,此函数仅供 resume 老 state 时读 evaluate_details。
 
-    从 evaluate.py 的 run_evaluate 返回后，state.results 中包含 eval_skipped 的 findings，
-    而 evaluate 内部的 results dict 包含所有评估详情。我们需要从 state 的 evaluate_details
-    或 findings-all.json 获取完整评估信息。
-
-    当前实现：eval_skipped 的有详情（存入 state.results），must_fix/verify 的只有 verdict。
-    为展示 must_fix/verify 的详情，从 evaluate_details 属性读取（如果有）。
+    新流程不再调用,但保留以兼容老 .evo-review/state-*.json 的展示需求。
     """
     # 收集所有评估结果
     eval_skipped_ids = set()

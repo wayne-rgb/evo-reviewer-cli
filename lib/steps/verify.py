@@ -4,7 +4,6 @@ import logging
 import re
 import subprocess
 import time
-import json
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -364,24 +363,23 @@ def _verify_must_fix(bug, wt, module, project_root, state=None):
 def _verify_red_green(bug, wt, module, project_root):
     """标准红绿验证流程。
 
-    流程：
-    1. 写测试（模式 B，无 Bash）
+    流程:
+    1. 写测试 (模式 B,无 Bash)
     2. CLI 跑测试
-    3. 测试通过 -> 幻觉，回滚
-    4. 测试失败 -> 检查失败原因是否相关
-    5. 不相关 -> 幻觉，回滚
-    6. 相关 -> 写修复
-    7. CLI 跑测试
-    8. 通过 -> verified
-    9. 失败 -> 重试一次
-    10. 仍失败 -> fix_failed，回滚
+    3. green   -> hallucination,回滚 (红测试都过 = bug 不存在)
+    4. infra_blocked / compile_broken / no_tests_ran -> 测试没真跑过,不结论
+    5. still_red -> 直接进 fix (跳过 CHECK_REASON opus 调用 — _classify_test_output
+       已经把"测试失败但与 bug 无关"的 80% 情况识别成 infra/compile;剩下 20%
+       即使是无关失败,opus 写完 fix 后跑测试还是 fail,会被标 fix_failed +
+       自动 revert,不会污染代码。每个 finding 省一次 60s opus 调用)
+    6. CLI 跑测试
+    7. green -> verified
+    8. 仍失败 -> 重试一次,仍失败 -> fix_failed,回滚
     """
-    from lib.claude import call_claude_session, call_claude_bare
+    from lib.claude import call_claude_session
     from lib.prompts.verify import (
-        WRITE_TEST_PROMPT, WRITE_FIX_PROMPT,
-        RETRY_FIX_PROMPT, CHECK_REASON_PROMPT,
+        WRITE_TEST_PROMPT, WRITE_FIX_PROMPT, RETRY_FIX_PROMPT,
     )
-    from lib.schemas.verify import CHECK_REASON_SCHEMA
 
     bug_id = bug["id"]
     verify_timeout = module.estimate_timeout(project_root, task="verify")
@@ -431,37 +429,11 @@ def _verify_red_green(bug, wt, module, project_root):
         _revert_changes(wt.path, bug, pre_snapshot=pre_snap)
         return _build_blocked_result(cls, bug_id, test_result["output"])
 
-    # 4. cls == "still_red" — 检查失败原因(是不是和 bug 真相关)
-    output_tail = _tail(test_result["output"], 50)
-    try:
-        reason = call_claude_bare(
-            prompt=CHECK_REASON_PROMPT.format(
-                bug_id=bug_id,
-                bug_description=bug.get("description", ""),
-                test_output=output_tail,
-            ),
-            model="opus",
-            tools="",
-            output_schema=CHECK_REASON_SCHEMA,
-            max_turns=3,
-            timeout=60,  # 轻量判断，60s 足够
-        )
-    except Exception:
-        reason = {"related": True, "reason": "无法判断，假设相关"}
-
-    if isinstance(reason, str):
-        try:
-            reason = json.loads(reason)
-        except json.JSONDecodeError:
-            reason = {"related": True, "reason": reason}
-
-    if not reason.get("related", True):
-        _revert_changes(wt.path, bug, pre_snapshot=pre_snap)
-        logger.info(f"[{bug_id}] 幻觉 — {reason.get('reason', '')}")
-        return {"status": "hallucination", "reason": reason.get("reason", "测试失败与 bug 无关")}
-
-    # 5. 红灯确认，写修复
-    logger.info(f"[{bug_id}] 红灯确认，开始写修复")
+    # 4. cls == "still_red" — 红灯确认,直接进 fix
+    # 跳过原来的 CHECK_REASON opus 调用 (60s × N findings 省下来)。
+    # 风险:无关失败 opus 会尝试在错地方修 → 修完测试仍 fail → 标 fix_failed +
+    # _revert_changes 兜底,代码不污染。
+    logger.info(f"[{bug_id}] 红灯确认,开始写修复")
     cross_module_hint = _build_cross_module_hint(bug)
     fix_prompt = WRITE_FIX_PROMPT.format(
         bug_id=bug_id,
